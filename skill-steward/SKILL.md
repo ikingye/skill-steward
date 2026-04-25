@@ -146,6 +146,14 @@ python3 scripts/skill_steward.py skills quality --project "$PWD" --format json
 
 Text output shows only skills with issues by default; use `--all` to include clean skills. The quality report assigns each skill a score from 0 to 100 and flags broad descriptions, hardcoded local absolute paths, non-executable shebang scripts, and shared versus agent-specific placement drift. Treat these findings as review prompts; fix the skill text or move the skill before deleting it.
 
+For project-specific exceptions, create `<repo>/.skill-steward.json`:
+
+```json
+{"quality": {"ignore_issue_codes": ["non-executable-script"], "ignore_skills": ["legacy-skill"], "ignore_paths": ["/vendor/skills/"]}}
+```
+
+Ignored findings appear in JSON as `ignored_issues` and do not reduce `quality_score`. Use `--policy /path/to/policy.json` to load another policy file.
+
 ## Safe Cleanup Rules
 
 - Never keep the same shared skill copied into multiple agent-specific directories just to make loading work; configure the agent loader instead.

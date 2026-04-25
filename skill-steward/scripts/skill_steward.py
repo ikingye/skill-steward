@@ -64,6 +64,7 @@ CONFIG_ENV = "SKILL_STEWARD_CONFIG"
 DEFAULT_CONFIG_PATH = Path("~/.config/skill-steward/config.json")
 TRASH_ROOT_REL = Path(".agents/.trash/skills")
 EVENT_LOG_REL = Path(".agents/skill-steward/events.jsonl")
+POLICY_FILENAMES = (".skill-steward.json", "skill-steward.json")
 
 PROTECTED_PARTS = {".system", "codex-primary-runtime", ".builtin", ".curated"}
 
@@ -391,6 +392,31 @@ def save_config(config: dict, config_path: Path | None = None) -> None:
     path = config_file(config_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def resolve_policy_path(project: Path | None = None, policy_path: Path | None = None) -> Path | None:
+    if policy_path is not None:
+        return policy_path.expanduser().resolve()
+    if project is None:
+        return None
+    for filename in POLICY_FILENAMES:
+        candidate = project / filename
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def load_policy(project: Path | None = None, policy_path: Path | None = None) -> tuple[dict, Path | None]:
+    path = resolve_policy_path(project, policy_path)
+    if path is None:
+        return {}, None
+    try:
+        policy = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise LayoutError(f"invalid policy JSON at {path}: {exc}") from exc
+    if not isinstance(policy, dict):
+        raise LayoutError(f"policy must be a JSON object: {path}")
+    return policy, path
 
 
 def list_managed_agents(config_path: Path | None = None) -> list[str]:
@@ -1498,6 +1524,26 @@ def add_quality_issue(issues: list[dict], code: str, severity: str, detail: str,
     issues.append({"code": code, "severity": severity, "detail": detail, "penalty": penalty})
 
 
+def policy_string_set(policy: dict, key: str) -> set[str]:
+    value = policy.get(key, [])
+    if isinstance(value, str):
+        return {value}
+    if isinstance(value, list):
+        return {item for item in value if isinstance(item, str)}
+    return set()
+
+
+def quality_issue_is_ignored(issue: dict, skill: dict, policy: dict) -> bool:
+    ignored_codes = policy_string_set(policy, "ignore_issue_codes")
+    ignored_skills = policy_string_set(policy, "ignore_skills")
+    ignored_paths = policy_string_set(policy, "ignore_paths")
+    if issue["code"] in ignored_codes:
+        return True
+    if skill["name"] in ignored_skills or skill["folder"] in ignored_skills:
+        return True
+    return any(pattern and pattern in skill["path"] for pattern in ignored_paths)
+
+
 def description_is_broad(description: str) -> bool:
     value = description.strip().lower()
     if not value:
@@ -1526,7 +1572,8 @@ def non_executable_shebang_scripts(skill_dir: Path) -> list[str]:
     return scripts
 
 
-def skill_quality_report(skills: list[dict]) -> list[dict]:
+def skill_quality_report(skills: list[dict], policy: dict | None = None) -> list[dict]:
+    policy = policy or {}
     rows: list[dict] = []
     for skill in skills:
         issues: list[dict] = []
@@ -1599,7 +1646,14 @@ def skill_quality_report(skills: list[dict]) -> list[dict]:
                 10,
             )
 
-        score = max(0, 100 - sum(issue["penalty"] for issue in issues))
+        active_issues: list[dict] = []
+        ignored_issues: list[dict] = []
+        for issue in issues:
+            if quality_issue_is_ignored(issue, skill, policy):
+                ignored_issues.append(issue)
+            else:
+                active_issues.append(issue)
+        score = max(0, 100 - sum(issue["penalty"] for issue in active_issues))
         rows.append(
             {
                 "skill": skill["name"],
@@ -1608,7 +1662,8 @@ def skill_quality_report(skills: list[dict]) -> list[dict]:
                 "agent": skill["agent"],
                 "protected": skill["protected"],
                 "quality_score": score,
-                "issues": issues,
+                "issues": active_issues,
+                "ignored_issues": ignored_issues,
             }
         )
 
@@ -1702,10 +1757,15 @@ def build_report(
     log_roots: list[Path] | None = None,
     now: datetime | None = None,
     stale_days: int = 30,
+    policy_path: Path | None = None,
 ) -> dict:
     current = normalize_now(now)
     home = (home or Path.home()).expanduser().resolve()
     project = project.expanduser().resolve() if project is not None else None
+    policy, loaded_policy_path = load_policy(project, policy_path)
+    quality_policy = policy.get("quality", {})
+    if not isinstance(quality_policy, dict):
+        quality_policy = {}
     skills, roots = discover_skills(home, project)
     duplicates = duplicate_report(skills)
     logs = default_log_roots(home, project) if log_roots is None else [path.expanduser().resolve() for path in log_roots]
@@ -1713,12 +1773,13 @@ def build_report(
     usage_windows = usage_window_report(skills, logs, current)
     usage_confidence = usage_confidence_report(skills, logs, days, current)
     cleanup_recommendations = cleanup_recommendation_report(skills, usage_confidence, current, stale_days)
-    quality = skill_quality_report(skills)
+    quality = skill_quality_report(skills, quality_policy)
     recommendations = build_recommendations(skills, duplicates, usage, days)
     return {
         "generated_at": current.isoformat(),
         "home": str(home),
         "project": str(project) if project else None,
+        "policy_path": str(loaded_policy_path) if loaded_policy_path else None,
         "days": days,
         "log_roots": [str(path) for path in logs],
         "roots": roots,
@@ -1738,6 +1799,8 @@ def print_text(report: dict) -> None:
     print(f"Home: {report['home']}")
     if report["project"]:
         print(f"Project: {report['project']}")
+    if report.get("policy_path"):
+        print(f"Policy: {report['policy_path']}")
     print(f"Skills: {len(report['skills'])}")
     print(f"Duplicates: {len(report['duplicates'])}")
     print(f"Quality Issues: {sum(1 for item in report.get('quality', []) if item.get('issues'))}")
@@ -1933,6 +1996,8 @@ code{background:#eef2ff;padding:2px 4px;border-radius:4px}
     ]
     if report.get("project"):
         sections.append(f"<div class=\"meta\">Project: <code>{html_cell(report.get('project'))}</code></div>")
+    if report.get("policy_path"):
+        sections.append(f"<div class=\"meta\">Policy: <code>{html_cell(report.get('policy_path'))}</code></div>")
     sections.extend(
         [
             "<div class=\"cards\">",
@@ -1967,6 +2032,7 @@ def handle_skills_command(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Quarantine, restore, or delete skill directories safely.")
     parser.add_argument("--home", type=Path, default=Path.home(), help="Home directory.")
     parser.add_argument("--project", type=Path, help="Optional project directory.")
+    parser.add_argument("--policy", type=Path, help="Optional skill-steward policy JSON file.")
     parser.add_argument("--format", choices=("text", "json"), default="text", help="Output format.")
     parser.add_argument("--stale-days", type=int, default=30, help="Age threshold for safe-to-remove suggestions.")
     subparsers = parser.add_subparsers(dest="skills_command", required=True)
@@ -1974,6 +2040,7 @@ def handle_skills_command(argv: list[str]) -> int:
     def add_common_options(subparser: argparse.ArgumentParser) -> None:
         subparser.add_argument("--home", type=Path, default=argparse.SUPPRESS, help="Home directory.")
         subparser.add_argument("--project", type=Path, default=argparse.SUPPRESS, help="Optional project directory.")
+        subparser.add_argument("--policy", type=Path, default=argparse.SUPPRESS, help="Optional skill-steward policy JSON file.")
         subparser.add_argument("--format", choices=("text", "json"), default=argparse.SUPPRESS, help="Output format.")
         subparser.add_argument("--stale-days", type=int, default=argparse.SUPPRESS, help="Age threshold for safe-to-remove suggestions.")
 
@@ -2024,20 +2091,29 @@ def handle_skills_command(argv: list[str]) -> int:
                 days=args.days,
                 log_roots=args.log_root,
                 stale_days=args.stale_days,
+                policy_path=args.policy,
             )
             payload = {
                 "cleanup_recommendations": report["cleanup_recommendations"],
                 "generated_at": report["generated_at"],
                 "home": report["home"],
                 "project": report["project"],
+                "policy_path": report["policy_path"],
             }
         elif args.skills_command == "quality":
-            report = build_report(home=args.home, project=args.project, log_roots=[], stale_days=args.stale_days)
+            report = build_report(
+                home=args.home,
+                project=args.project,
+                log_roots=[],
+                stale_days=args.stale_days,
+                policy_path=args.policy,
+            )
             payload = {
                 "quality": report["quality"],
                 "generated_at": report["generated_at"],
                 "home": report["home"],
                 "project": report["project"],
+                "policy_path": report["policy_path"],
             }
         else:
             parser.error(f"unknown command: {args.skills_command}")
@@ -2270,6 +2346,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--stale-days", type=int, default=30, help="Age threshold for safe-to-remove cleanup suggestions.")
     parser.add_argument("--log-root", action="append", type=Path, help="Additional or explicit log root to scan.")
     parser.add_argument("--config", type=Path, help="Config file path for managed agents.")
+    parser.add_argument("--policy", type=Path, help="Optional skill-steward policy JSON file.")
     parser.add_argument(
         "--apply-project-layout",
         action="store_true",
@@ -2319,13 +2396,18 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     log_roots = args.log_root if args.log_root else None
-    report = build_report(
-        home=args.home,
-        project=args.project,
-        days=args.days,
-        log_roots=log_roots,
-        stale_days=args.stale_days,
-    )
+    try:
+        report = build_report(
+            home=args.home,
+            project=args.project,
+            days=args.days,
+            log_roots=log_roots,
+            stale_days=args.stale_days,
+            policy_path=args.policy,
+        )
+    except LayoutError as exc:
+        print(f"Report failed: {exc}", file=sys.stderr)
+        return 1
     if layout_actions:
         report["layout_actions"] = layout_actions
     if args.format == "json":

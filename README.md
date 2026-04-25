@@ -178,6 +178,20 @@ The quality report assigns each skill a `quality_score` from 0 to 100 and lists 
 - `non-executable-script`: a helper script has a shebang but is not executable
 - `agent-specific-in-shared` or `agent-neutral-in-agent-specific`: the skill appears to be in the wrong shared or native directory
 
+Projects can keep reviewed exceptions in `.skill-steward.json`:
+
+```json
+{
+  "quality": {
+    "ignore_issue_codes": ["non-executable-script"],
+    "ignore_skills": ["legacy-skill"],
+    "ignore_paths": ["/vendor/skills/"]
+  }
+}
+```
+
+Ignored findings appear in JSON as `ignored_issues` and do not reduce `quality_score`. Use `--policy /path/to/policy.json` to load a policy outside the project root.
+
 ### Global Audit
 
 Audit global shared and agent-specific skills:

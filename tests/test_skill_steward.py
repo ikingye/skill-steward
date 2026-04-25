@@ -530,6 +530,27 @@ class ManageAgentSkillsTest(unittest.TestCase):
 
             self.assertEqual(quality["block-skill"]["quality_score"], 100)
 
+    def test_project_policy_can_ignore_quality_issue_codes(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "repo"
+            home.mkdir()
+            project.mkdir()
+            write_skill(project / ".agents" / "skills", "bad-skill", "bad-skill", "Use when doing anything")
+            (project / ".skill-steward.json").write_text(
+                json.dumps({"quality": {"ignore_issue_codes": ["broad-description"]}}),
+                encoding="utf-8",
+            )
+
+            report = module.build_report(home=home, project=project, days=90, log_roots=[])
+            quality = {item["skill"]: item for item in report["quality"]}
+
+            self.assertEqual(quality["bad-skill"]["quality_score"], 100)
+            self.assertEqual(quality["bad-skill"]["issues"], [])
+            self.assertEqual(quality["bad-skill"]["ignored_issues"][0]["code"], "broad-description")
+
     def test_symlinked_agent_root_does_not_create_false_duplicate(self):
         module = load_module()
 
