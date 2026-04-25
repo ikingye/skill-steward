@@ -102,6 +102,11 @@ MAX_LOG_BYTES = 100 * 1024 * 1024
 READ_TAIL_BYTES = 256 * 1024
 USAGE_WINDOWS = (("last_24h", "24h", 1), ("last_7d", "7d", 7), ("last_30d", "30d", 30))
 TIMESTAMP_KEYS = ("timestamp", "time", "created_at", "createdAt", "date", "ts")
+STRUCTURED_SKILL_KEYS = ("skill", "skill_name", "skillName")
+STRUCTURED_EVENT_KEYS = ("event", "action", "type")
+USED_EVENTS = {"use", "used", "using", "load", "loaded", "invoke", "invoked", "activate", "activated", "trigger", "triggered"}
+LIKELY_EVENTS = {"request", "requested", "recommend", "recommended", "suggest", "suggested", "select", "selected"}
+SIGNAL_WEIGHTS = {"used": 1.0, "likely": 0.7, "mention": 0.2}
 ISO_TIMESTAMP_PATTERN = re.compile(
     r"\d{4}-\d{2}-\d{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:?[0-9]{2})?"
 )
@@ -819,6 +824,87 @@ def matched_skill_names(line: str, name_lookup: dict[str, str], name_pattern: re
     return {name_lookup[match.group(1)] for match in name_pattern.finditer(line.lower())}
 
 
+def skill_name_boundary(name: str) -> str:
+    return r"(?<![A-Za-z0-9_-])" + re.escape(name.lower()) + r"(?![A-Za-z0-9_-])"
+
+
+def parse_json_line(line: str) -> dict | None:
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def payload_skill_names(payload: dict) -> set[str]:
+    names = set()
+    for key in STRUCTURED_SKILL_KEYS:
+        value = payload.get(key)
+        if isinstance(value, str):
+            names.add(value.lower())
+        elif isinstance(value, list):
+            names.update(item.lower() for item in value if isinstance(item, str))
+    return names
+
+
+def structured_signal(line: str, skill_name: str) -> str | None:
+    payload = parse_json_line(line)
+    if payload is None or skill_name.lower() not in payload_skill_names(payload):
+        return None
+    events = {
+        str(payload.get(key, "")).strip().lower().replace("-", "_")
+        for key in STRUCTURED_EVENT_KEYS
+        if payload.get(key) is not None
+    }
+    if events & USED_EVENTS:
+        return "used"
+    if events & LIKELY_EVENTS:
+        return "likely"
+    return None
+
+
+def negates_skill_use(lower_line: str, skill_name: str) -> bool:
+    name = skill_name_boundary(skill_name)
+    patterns = [
+        rf"\b(?:do not|don't|did not|didn't|not|without)\s+"
+        rf"(?:use|using|load|loading|invoke|invoking|activate|activating|run|running)\s+"
+        rf"(?:the\s+)?(?:skill\s+)?{name}",
+        rf"(?:不要|别|没有|未)(?:使用|加载|调用|激活)\s*{name}",
+    ]
+    return any(re.search(pattern, lower_line) for pattern in patterns)
+
+
+def classify_skill_signal(line: str, skill_name: str) -> str:
+    structured = structured_signal(line, skill_name)
+    if structured:
+        return structured
+
+    lower = line.lower()
+    if negates_skill_use(lower, skill_name):
+        return "mention"
+
+    name = skill_name_boundary(skill_name)
+    strong_patterns = [
+        rf"\b(?:using|used|loaded|loading|invoked|invoking|activated|activating|selected|selecting|triggered|triggering)\s+"
+        rf"(?:the\s+)?(?:skill\s+)?{name}",
+        rf"(?:skill\s+)?{name}\s+(?:was\s+|is\s+|has\s+been\s+)?"
+        rf"(?:used|loaded|invoked|activated|selected|triggered)",
+        rf"(?:正在使用|已使用|加载了|调用了|激活了)\s*(?:skill\s*)?{name}",
+    ]
+    if any(re.search(pattern, lower) for pattern in strong_patterns):
+        return "used"
+
+    medium_patterns = [
+        rf"\b(?:use|run|call|trigger|select|try|apply)\s+(?:the\s+)?(?:skill\s+)?{name}",
+        rf"\b(?:ask|tell)\s+.*{name}",
+        rf"(?:使用|用|运行|调用)\s*(?:skill\s*)?{name}",
+    ]
+    if any(re.search(pattern, lower) for pattern in medium_patterns):
+        return "likely"
+
+    return "mention"
+
+
 def iter_log_files(roots: Iterable[Path], days: int, now: datetime | None = None) -> Iterable[Path]:
     cutoff = None
     current = normalize_now(now)
@@ -952,6 +1038,123 @@ def usage_window_report(
     )
 
 
+def usage_confidence_report(
+    skills: list[dict],
+    log_roots: list[Path],
+    days: int,
+    now: datetime | None = None,
+) -> list[dict]:
+    current = normalize_now(now)
+    names = sorted({skill["name"] for skill in skills})
+    counters = {
+        name: {
+            "name": name,
+            "mentions": 0,
+            "actual_or_likely_uses": 0,
+            "strong_signals": 0,
+            "medium_signals": 0,
+            "weak_signals": 0,
+            "success_signals": 0,
+            "failure_signals": 0,
+            "confidence": 0.0,
+            "event_type": "none",
+            "by_agent": {},
+            "last_seen": None,
+        }
+        for name in names
+    }
+    name_lookup, name_pattern = skill_name_pattern(names)
+
+    for log_file in iter_log_files(log_roots, days, current):
+        agent = infer_agent_from_path(log_file)
+        try:
+            fallback_timestamp = log_file.stat().st_mtime
+            lines = read_recent_log_text(log_file).splitlines()
+        except OSError:
+            continue
+
+        for line in lines:
+            matched_names = matched_skill_names(line, name_lookup, name_pattern)
+            if not matched_names:
+                continue
+            lower = line.lower()
+            positive = line_has_term(lower, POSITIVE_TERMS)
+            negative = line_has_term(lower, NEGATIVE_TERMS)
+            event_timestamp = line_timestamp(line, fallback_timestamp)
+            event_iso = datetime.fromtimestamp(event_timestamp, timezone.utc).isoformat()
+
+            for name in matched_names:
+                signal = classify_skill_signal(line, name)
+                row = counters[name]
+                row["mentions"] += 1
+                if signal in {"used", "likely"}:
+                    row["actual_or_likely_uses"] += 1
+                if signal == "used":
+                    row["strong_signals"] += 1
+                elif signal == "likely":
+                    row["medium_signals"] += 1
+                else:
+                    row["weak_signals"] += 1
+                if positive:
+                    row["success_signals"] += 1
+                if negative:
+                    row["failure_signals"] += 1
+                if row["last_seen"] is None or event_iso > row["last_seen"]:
+                    row["last_seen"] = event_iso
+
+                agent_row = row["by_agent"].setdefault(
+                    agent,
+                    {
+                        "mentions": 0,
+                        "actual_or_likely_uses": 0,
+                        "strong_signals": 0,
+                        "medium_signals": 0,
+                        "weak_signals": 0,
+                        "success_signals": 0,
+                        "failure_signals": 0,
+                    },
+                )
+                agent_row["mentions"] += 1
+                if signal in {"used", "likely"}:
+                    agent_row["actual_or_likely_uses"] += 1
+                if signal == "used":
+                    agent_row["strong_signals"] += 1
+                elif signal == "likely":
+                    agent_row["medium_signals"] += 1
+                else:
+                    agent_row["weak_signals"] += 1
+                if positive:
+                    agent_row["success_signals"] += 1
+                if negative:
+                    agent_row["failure_signals"] += 1
+
+    for row in counters.values():
+        mentions = row["mentions"]
+        if mentions:
+            weighted = (
+                row["strong_signals"] * SIGNAL_WEIGHTS["used"]
+                + row["medium_signals"] * SIGNAL_WEIGHTS["likely"]
+                + row["weak_signals"] * SIGNAL_WEIGHTS["mention"]
+            )
+            row["confidence"] = round(weighted / mentions, 2)
+        if row["strong_signals"]:
+            row["event_type"] = "used"
+        elif row["medium_signals"]:
+            row["event_type"] = "likely"
+        elif row["weak_signals"]:
+            row["event_type"] = "mention"
+
+    return sorted(
+        counters.values(),
+        key=lambda item: (
+            -item["actual_or_likely_uses"],
+            -item["confidence"],
+            -item["mentions"],
+            item["name"],
+        ),
+    )
+
+
 def build_recommendations(skills: list[dict], duplicates: list[dict], usage: list[dict], days: int) -> list[dict]:
     recommendations: list[dict] = []
     usage_by_name = {item["name"]: item for item in usage}
@@ -1047,6 +1250,7 @@ def build_report(
     logs = default_log_roots(home, project) if log_roots is None else [path.expanduser().resolve() for path in log_roots]
     usage = usage_report(skills, logs, days, current)
     usage_windows = usage_window_report(skills, logs, current)
+    usage_confidence = usage_confidence_report(skills, logs, days, current)
     recommendations = build_recommendations(skills, duplicates, usage, days)
     return {
         "generated_at": current.isoformat(),
@@ -1059,6 +1263,7 @@ def build_report(
         "duplicates": duplicates,
         "usage": usage,
         "usage_windows": usage_windows,
+        "usage_confidence": usage_confidence,
         "recommendations": recommendations,
     }
 
@@ -1110,6 +1315,25 @@ def print_text(report: dict) -> None:
         for item in rows:
             counts = " ".join(str(item[key]).rjust(5) for key, _, _ in USAGE_WINDOWS)
             print(f"{item['name']:<{name_width}} {counts} {item['last_seen'] or 'never'}")
+        print()
+
+    if report.get("usage_confidence"):
+        print("Usage Confidence")
+        rows = report["usage_confidence"]
+        name_width = max([len("Skill"), *[len(item["name"]) for item in rows]])
+        print(f"{'Skill':<{name_width}} {'Likely':>6} {'Mentions':>8} {'Confidence':>10} {'Type':>7} {'+':>3} {'-':>3} Last Seen")
+        print(f"{'-' * name_width} {'-' * 6} {'-' * 8} {'-' * 10} {'-' * 7} {'-' * 3} {'-' * 3} ---------")
+        for item in rows:
+            print(
+                f"{item['name']:<{name_width}} "
+                f"{item['actual_or_likely_uses']:>6} "
+                f"{item['mentions']:>8} "
+                f"{item['confidence']:>10.2f} "
+                f"{item['event_type']:>7} "
+                f"{item['success_signals']:>3} "
+                f"{item['failure_signals']:>3} "
+                f"{item['last_seen'] or 'never'}"
+            )
         print()
 
     if report["recommendations"]:

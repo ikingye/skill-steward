@@ -12,6 +12,7 @@ It helps agents:
 - configure managed agents from a numbered selection menu with `install`, `add`, `delete`, `set`, and `list`
 - scan local session logs for approximate usage and effectiveness signals
 - summarize each skill's approximate usage over the last 24 hours, 7 days, and 30 days
+- classify usage evidence as used, likely, or mention-only with a confidence score
 - suggest stale, duplicate, or misplaced skills for review
 
 The report mode is non-destructive by default. `--apply-project-layout` intentionally changes project directories to match the canonical hidden layout.
@@ -108,6 +109,40 @@ The text report includes a `Usage by Window` table with per-skill counts for the
 ```
 
 These are approximate mention counts from local logs. When a log line has a timestamp, `skill-steward` uses it; otherwise it falls back to the log file modification time.
+
+The text report also includes a `Usage Confidence` table. JSON output exposes the same data in `usage_confidence`:
+
+```json
+{
+  "name": "skill-steward",
+  "mentions": 18,
+  "actual_or_likely_uses": 12,
+  "strong_signals": 7,
+  "medium_signals": 5,
+  "weak_signals": 6,
+  "confidence": 0.73,
+  "event_type": "used",
+  "success_signals": 8,
+  "failure_signals": 1,
+  "by_agent": {
+    "codex": {
+      "mentions": 14,
+      "actual_or_likely_uses": 10,
+      "strong_signals": 6,
+      "medium_signals": 4,
+      "weak_signals": 4
+    }
+  }
+}
+```
+
+Signal strength is intentionally conservative:
+
+- `used`: strong evidence such as `Using <skill>`, `Loaded <skill>`, `Invoked <skill>`, or a structured log event with `event=used`
+- `likely`: explicit intent such as `Use <skill>` or a structured recommendation/request event
+- `mention`: the skill name appears, but the line does not prove usage
+
+`confidence` is a weighted score over mentions: strong signals count as `1.0`, likely signals as `0.7`, and mention-only signals as `0.2`.
 
 ### Global Audit
 

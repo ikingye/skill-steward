@@ -189,6 +189,64 @@ class ManageAgentSkillsTest(unittest.TestCase):
             self.assertEqual(usage_windows["beta-skill"]["last_7d"], 1)
             self.assertEqual(usage_windows["beta-skill"]["last_30d"], 1)
 
+    def test_usage_confidence_distinguishes_used_likely_and_mention_signals(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            write_skill(home / ".agents" / "skills", "alpha-skill", "alpha-skill", "Use when testing alpha")
+            write_skill(home / ".agents" / "skills", "beta-skill", "beta-skill", "Use when testing beta")
+            write_skill(home / ".agents" / "skills", "gamma-skill", "gamma-skill", "Use when testing gamma")
+
+            now = datetime(2026, 4, 25, 12, 0, tzinfo=timezone.utc)
+            log_dir = home / ".codex" / "sessions"
+            log_dir.mkdir(parents=True)
+            (log_dir / "session.jsonl").write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "timestamp": (now - timedelta(hours=1)).isoformat(),
+                                "text": "Using alpha-skill to audit skills. Validation passed.",
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": (now - timedelta(hours=2)).isoformat(),
+                                "text": "Use beta-skill to inspect this project. It failed.",
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": (now - timedelta(hours=3)).isoformat(),
+                                "text": "gamma-skill appears in the README.",
+                            }
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            report = module.build_report(home=home, project=None, days=90, log_roots=[log_dir], now=now)
+            confidence = {item["name"]: item for item in report["usage_confidence"]}
+
+            self.assertEqual(confidence["alpha-skill"]["event_type"], "used")
+            self.assertEqual(confidence["alpha-skill"]["strong_signals"], 1)
+            self.assertEqual(confidence["alpha-skill"]["actual_or_likely_uses"], 1)
+            self.assertEqual(confidence["alpha-skill"]["success_signals"], 1)
+            self.assertEqual(confidence["alpha-skill"]["confidence"], 1.0)
+
+            self.assertEqual(confidence["beta-skill"]["event_type"], "likely")
+            self.assertEqual(confidence["beta-skill"]["medium_signals"], 1)
+            self.assertEqual(confidence["beta-skill"]["actual_or_likely_uses"], 1)
+            self.assertEqual(confidence["beta-skill"]["failure_signals"], 1)
+            self.assertEqual(confidence["beta-skill"]["confidence"], 0.7)
+
+            self.assertEqual(confidence["gamma-skill"]["event_type"], "mention")
+            self.assertEqual(confidence["gamma-skill"]["weak_signals"], 1)
+            self.assertEqual(confidence["gamma-skill"]["actual_or_likely_uses"], 0)
+            self.assertEqual(confidence["gamma-skill"]["confidence"], 0.2)
+
     def test_text_report_prints_usage_windows_table(self):
         module = load_module()
 
@@ -218,6 +276,37 @@ class ManageAgentSkillsTest(unittest.TestCase):
             self.assertIn("24h", text)
             self.assertIn("7d", text)
             self.assertIn("30d", text)
+            self.assertIn("alpha-skill", text)
+
+    def test_text_report_prints_usage_confidence_table(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            write_skill(home / ".agents" / "skills", "alpha-skill", "alpha-skill", "Use when testing alpha")
+            now = datetime(2026, 4, 25, 12, 0, tzinfo=timezone.utc)
+            log_dir = home / ".codex" / "sessions"
+            log_dir.mkdir(parents=True)
+            (log_dir / "session.jsonl").write_text(
+                json.dumps(
+                    {
+                        "timestamp": (now - timedelta(hours=1)).isoformat(),
+                        "text": "Using alpha-skill to audit skills.",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            report = module.build_report(home=home, project=None, days=90, log_roots=[log_dir], now=now)
+            output = StringIO()
+            with redirect_stdout(output):
+                module.print_text(report)
+
+            text = output.getvalue()
+            self.assertIn("Usage Confidence", text)
+            self.assertIn("Likely", text)
+            self.assertIn("Mentions", text)
+            self.assertIn("Confidence", text)
             self.assertIn("alpha-skill", text)
 
     def test_symlinked_agent_root_does_not_create_false_duplicate(self):

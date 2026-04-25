@@ -111,6 +111,13 @@ The text report includes a `Usage by Window` table for each skill with approxima
 
 When log lines contain timestamps, the script uses those timestamps for windowed counts. Otherwise it falls back to the log file modification time.
 
+The report also includes `Usage Confidence`, exposed as `usage_confidence` in JSON. It separates:
+- `used`: strong evidence such as `Using <skill>`, `Loaded <skill>`, `Invoked <skill>`, or structured `event=used` logs.
+- `likely`: explicit intent such as `Use <skill>` or structured request/recommendation logs.
+- `mention`: the skill name appears but the line does not prove usage.
+
+Use `actual_or_likely_uses`, `mentions`, `event_type`, `confidence`, `success_signals`, and `failure_signals` together. `confidence` weights strong signals as `1.0`, likely signals as `0.7`, and mention-only signals as `0.2`.
+
 Treat these as triage signals, not truth. A high count may include discussions about a skill rather than real activation. A low count may mean an agent does not log skill use explicitly. Use the ranking to choose what to inspect manually.
 
 ## Safe Cleanup Rules
