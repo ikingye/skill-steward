@@ -1,0 +1,512 @@
+import importlib.util
+import json
+import sys
+import tempfile
+import unittest
+from contextlib import redirect_stdout
+from io import StringIO
+from pathlib import Path
+
+
+SCRIPT_PATH = Path(__file__).resolve().parents[1] / "skill-steward" / "scripts" / "skill_steward.py"
+
+
+def load_module():
+    spec = importlib.util.spec_from_file_location("skill_steward", SCRIPT_PATH)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def write_skill(root: Path, folder: str, name: str, description: str, body: str = "Body") -> Path:
+    path = root / folder
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: {description}\n---\n\n# {name}\n\n{body}\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+class ManageAgentSkillsTest(unittest.TestCase):
+    def test_inventory_detects_duplicates_and_scope_recommendations(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            write_skill(home / ".agents" / "skills", "shared-only", "shared-only", "Use when managing general notes")
+            write_skill(home / ".agents" / "skills", "codex-tool", "codex-tool", "Use when working with Codex CLI sessions")
+            write_skill(home / ".codex" / "skills", "generic-helper", "generic-helper", "Use when organizing research")
+            write_skill(home / ".claude" / "skills", "shared-only", "shared-only", "Use when managing general notes")
+
+            report = module.build_report(home=home, project=None, days=90, log_roots=[])
+
+            duplicates = {item["name"]: item for item in report["duplicates"]}
+            self.assertIn("shared-only", duplicates)
+            self.assertEqual(len(duplicates["shared-only"]["locations"]), 2)
+
+            recommendations = {(item["skill"], item["recommendation"]) for item in report["recommendations"]}
+            self.assertIn(("codex-tool", "move-to-agent-specific"), recommendations)
+            self.assertIn(("generic-helper", "move-to-shared"), recommendations)
+
+    def test_shared_multi_agent_skill_is_not_misclassified_as_agent_specific(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            write_skill(
+                home / ".agents" / "skills",
+                "skill-steward",
+                "skill-steward",
+                "Use when managing Codex, Claude Code, Gemini CLI, and Cursor skills",
+                body="Manage shared and agent-specific directories without duplicating skills.",
+            )
+            write_skill(
+                home / ".agents" / "skills",
+                "openai-api-helper",
+                "openai-api-helper",
+                "Use when working with OpenAI API documentation",
+                body="This can be wrapped for Codex skills but is not Codex-only.",
+            )
+
+            report = module.build_report(home=home, project=None, days=90, log_roots=[])
+            placement_recommendations = {
+                (item["skill"], item["recommendation"]) for item in report["recommendations"]
+            }
+
+            self.assertNotIn(("skill-steward", "move-to-agent-specific"), placement_recommendations)
+            self.assertNotIn(("openai-api-helper", "move-to-agent-specific"), placement_recommendations)
+
+    def test_agent_specific_body_prevents_false_move_to_shared(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            write_skill(
+                home / ".codex" / "skills",
+                "playwright",
+                "playwright",
+                "Use when automating browsers",
+                body='export CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"',
+            )
+            write_skill(
+                home / ".claude" / "skills",
+                "create-colleague",
+                "create-colleague",
+                "Use when creating colleague skills",
+                body="Run python3 ${CLAUDE_SKILL_DIR}/tools/skill_writer.py from Claude Code.",
+            )
+
+            report = module.build_report(home=home, project=None, days=90, log_roots=[])
+            placement_recommendations = {
+                (item["skill"], item["recommendation"]) for item in report["recommendations"]
+            }
+
+            self.assertNotIn(("playwright", "move-to-shared"), placement_recommendations)
+            self.assertNotIn(("create-colleague", "move-to-shared"), placement_recommendations)
+
+    def test_usage_scan_counts_agent_mentions_and_effectiveness_proxy(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            write_skill(home / ".agents" / "skills", "skill-steward", "skill-steward", "Use when auditing skills")
+            write_skill(home / ".agents" / "skills", "unused-skill", "unused-skill", "Use when no logs mention it")
+
+            log_dir = home / ".codex" / "sessions"
+            log_dir.mkdir(parents=True)
+            (log_dir / "session.jsonl").write_text(
+                "\n".join(
+                    [
+                        json.dumps({"text": "Using skill-steward to audit skills. Validation passed."}),
+                        json.dumps({"text": "skill-steward completed successfully."}),
+                        json.dumps({"text": "unused-skill failed with an error."}),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            report = module.build_report(home=home, project=None, days=90, log_roots=[log_dir])
+            usage = {item["name"]: item for item in report["usage"]}
+
+            self.assertEqual(usage["skill-steward"]["total_mentions"], 2)
+            self.assertEqual(usage["skill-steward"]["by_agent"]["codex"], 2)
+            self.assertGreater(usage["skill-steward"]["effectiveness_score"], 0.5)
+            self.assertEqual(usage["unused-skill"]["negative_signals"], 1)
+
+    def test_symlinked_agent_root_does_not_create_false_duplicate(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            shared_root = home / ".agents" / "skills"
+            write_skill(shared_root, "shared-only", "shared-only", "Use when managing general notes")
+
+            cursor_parent = home / ".cursor"
+            cursor_parent.mkdir(parents=True)
+            (cursor_parent / "skills").symlink_to(shared_root, target_is_directory=True)
+
+            report = module.build_report(home=home, project=None, days=90, log_roots=[])
+            shared_only = [item for item in report["skills"] if item["name"] == "shared-only"]
+
+            self.assertEqual(len(shared_only), 1)
+            self.assertFalse(any(item["name"] == "shared-only" for item in report["duplicates"]))
+
+    def test_apply_project_layout_migrates_legacy_skills_and_creates_agent_dirs(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "repo"
+            home.mkdir()
+            project.mkdir()
+            write_skill(project / "skills", "shared-only", "shared-only", "Use when managing general notes")
+
+            (project / ".agents").mkdir()
+            (project / ".agents" / "skills").symlink_to("../skills", target_is_directory=True)
+
+            (project / ".claude").mkdir()
+            (project / ".claude" / "skills").symlink_to("../skills", target_is_directory=True)
+
+            actions = module.apply_project_layout(project=project, agents=["codex", "claude"])
+
+            self.assertFalse((project / "skills").exists())
+            self.assertFalse((project / ".agents" / "skills").is_symlink())
+            self.assertTrue((project / ".agents" / "skills" / "shared-only" / "SKILL.md").is_file())
+            self.assertTrue((project / ".codex" / "skills").is_dir())
+            self.assertTrue((project / ".claude" / "skills").is_dir())
+            self.assertFalse((project / ".claude" / "skills").is_symlink())
+            self.assertTrue((project / "AGENTS.md").read_text(encoding="utf-8").find(".agents/skills") >= 0)
+            self.assertTrue((project / "CLAUDE.md").read_text(encoding="utf-8").find(".claude/skills") >= 0)
+            self.assertTrue(any(action["action"] == "move-legacy-skills" for action in actions))
+
+            report = module.build_report(home=home, project=project, days=90, log_roots=[])
+            self.assertEqual([d for d in report["duplicates"] if d["name"] == "shared-only"], [])
+
+    def test_apply_project_layout_removes_identical_agent_specific_duplicates(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "repo"
+            project.mkdir()
+            write_skill(project / ".agents" / "skills", "shared-only", "shared-only", "Use when managing general notes")
+            write_skill(project / ".codex" / "skills", "shared-only", "shared-only", "Use when managing general notes")
+
+            actions = module.apply_project_layout(project=project, agents=["codex"])
+
+            self.assertTrue((project / ".agents" / "skills" / "shared-only").exists())
+            self.assertFalse((project / ".codex" / "skills" / "shared-only").exists())
+            self.assertTrue(any(action["action"] == "remove-identical-duplicate" for action in actions))
+
+    def test_apply_project_layout_replaces_legacy_unmanaged_loader_text(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "repo"
+            project.mkdir()
+            (project / "AGENTS.md").write_text(
+                "\n".join(
+                    [
+                        "# Project Skills",
+                        "",
+                        "Project shared skills live in `.agents/skills`. Codex-specific project skills live in `.codex/skills`.",
+                        "",
+                        "When working in this repository with Codex, consider both directories as project skill sources:",
+                        "- Use `.agents/skills` for agent-neutral GPU/AICP workflows.",
+                        "- Use `.codex/skills` only for Codex-specific workflows, tool names, or runtime behavior.",
+                        "",
+                        "Do not duplicate the same skill name in both directories. If a skill is useful outside Codex, keep the canonical copy in `.agents/skills`.",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            module.apply_project_layout(project=project, agents=["codex"])
+
+            text = (project / "AGENTS.md").read_text(encoding="utf-8")
+            self.assertEqual(text.count("# Project Skills"), 1)
+            self.assertIn("<!-- skill-steward project skills start -->", text)
+            self.assertNotIn("GPU/AICP workflows", text)
+
+    def test_managed_agents_config_supports_add_delete_and_layout_defaults(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.json"
+            project = Path(tmp) / "repo"
+            project.mkdir()
+            write_skill(project / "skills", "shared-only", "shared-only", "Use when managing general notes")
+
+            self.assertEqual(module.list_managed_agents(config_path=config_path), ["codex", "claude"])
+
+            added = module.add_managed_agents(["gemini", "codex"], config_path=config_path)
+            self.assertEqual(added, ["codex", "claude", "gemini"])
+
+            deleted = module.delete_managed_agents(["claude"], config_path=config_path)
+            self.assertEqual(deleted, ["codex", "gemini"])
+
+            module.apply_project_layout(project=project, agents=None, config_path=config_path)
+
+            self.assertTrue((project / ".codex" / "skills").is_dir())
+            self.assertTrue((project / ".gemini" / "skills").is_dir())
+            self.assertFalse((project / ".claude" / "skills").exists())
+
+    def test_agents_cli_add_delete_list(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.json"
+
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(module.main(["agents", "set", "codex", "--config", str(config_path)]), 0)
+            self.assertEqual(module.list_managed_agents(config_path=config_path), ["codex"])
+
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(module.main(["agents", "add", "claude", "gemini", "--config", str(config_path)]), 0)
+            self.assertEqual(module.list_managed_agents(config_path=config_path), ["codex", "claude", "gemini"])
+
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(module.main(["agents", "delete", "claude", "--config", str(config_path)]), 0)
+            self.assertEqual(module.list_managed_agents(config_path=config_path), ["codex", "gemini"])
+
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(module.main(["agents", "list", "--config", str(config_path)]), 0)
+            self.assertIn("codex", output.getvalue())
+            self.assertIn("gemini", output.getvalue())
+
+    def test_top_level_agent_aliases_and_install_command(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.json"
+            project = Path(tmp) / "repo"
+            project.mkdir()
+
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(
+                    module.main(["install", "codex", "gemini", "--config", str(config_path), "--project", str(project)]),
+                    0,
+                )
+            self.assertEqual(module.list_managed_agents(config_path=config_path), ["codex", "gemini"])
+            self.assertTrue((project / ".codex" / "skills").is_dir())
+            self.assertTrue((project / ".gemini" / "skills").is_dir())
+
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(module.main(["add", "claude", "--config", str(config_path)]), 0)
+            self.assertEqual(module.list_managed_agents(config_path=config_path), ["codex", "gemini", "claude"])
+
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(module.main(["delete", "gemini", "--config", str(config_path)]), 0)
+            self.assertEqual(module.list_managed_agents(config_path=config_path), ["codex", "claude"])
+
+    def test_no_arg_agent_commands_prompt_for_numbered_selection(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.json"
+            project = Path(tmp) / "repo"
+            project.mkdir()
+            original_stdin = sys.stdin
+            try:
+                output = StringIO()
+                sys.stdin = StringIO("1,3\n")
+                with redirect_stdout(output):
+                    self.assertEqual(
+                        module.main(["install", "--config", str(config_path), "--project", str(project)]),
+                        0,
+                    )
+                self.assertEqual(module.list_managed_agents(config_path=config_path), ["codex", "gemini"])
+                self.assertIn("Select agents", output.getvalue())
+                self.assertTrue((project / ".codex" / "skills").is_dir())
+                self.assertTrue((project / ".gemini" / "skills").is_dir())
+
+                output = StringIO()
+                sys.stdin = StringIO("1\n")
+                with redirect_stdout(output):
+                    self.assertEqual(module.main(["add", "--config", str(config_path)]), 0)
+                self.assertEqual(module.list_managed_agents(config_path=config_path), ["codex", "gemini", "claude"])
+
+                output = StringIO()
+                sys.stdin = StringIO("2\n")
+                with redirect_stdout(output):
+                    self.assertEqual(module.main(["delete", "--config", str(config_path)]), 0)
+                self.assertEqual(module.list_managed_agents(config_path=config_path), ["codex", "claude"])
+
+                output = StringIO()
+                sys.stdin = StringIO("2,4\n")
+                with redirect_stdout(output):
+                    self.assertEqual(module.main(["set", "--config", str(config_path)]), 0)
+                self.assertEqual(module.list_managed_agents(config_path=config_path), ["claude", "cursor"])
+            finally:
+                sys.stdin = original_stdin
+
+    def test_native_bridges_link_shared_skills_into_agent_native_dirs(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "repo"
+            home.mkdir()
+            project.mkdir()
+            write_skill(home / ".agents" / "skills", "global-shared", "global-shared", "Use when managing general notes")
+            write_skill(project / ".agents" / "skills", "project-shared", "project-shared", "Use when managing project notes")
+            write_skill(project / ".claude" / "skills", "claude-only", "claude-only", "Use when working with Claude-specific tools")
+
+            actions = module.apply_native_bridges(home=home, project=project, agents=["codex", "claude"])
+
+            global_codex_bridge = home / ".codex" / "skills" / "global-shared"
+            global_claude_bridge = home / ".claude" / "skills" / "global-shared"
+            project_codex_bridge = project / ".codex" / "skills" / "project-shared"
+            project_claude_bridge = project / ".claude" / "skills" / "project-shared"
+
+            self.assertTrue(global_codex_bridge.is_symlink())
+            self.assertTrue(global_claude_bridge.is_symlink())
+            self.assertTrue(project_codex_bridge.is_symlink())
+            self.assertTrue(project_claude_bridge.is_symlink())
+            self.assertEqual(global_codex_bridge.resolve(), (home / ".agents" / "skills" / "global-shared").resolve())
+            self.assertEqual(project_claude_bridge.resolve(), (project / ".agents" / "skills" / "project-shared").resolve())
+            self.assertTrue((project / ".claude" / "skills" / "claude-only").is_dir())
+            self.assertTrue(any(action["action"] == "create-native-bridge" for action in actions))
+
+            report = module.build_report(home=home, project=project, days=90, log_roots=[])
+            self.assertFalse(any(item["name"] in {"global-shared", "project-shared"} for item in report["duplicates"]))
+
+    def test_native_bridges_replace_identical_agent_copy_with_symlink(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            home.mkdir()
+            write_skill(home / ".agents" / "skills", "shared-only", "shared-only", "Use when managing general notes")
+            write_skill(home / ".codex" / "skills", "shared-only", "shared-only", "Use when managing general notes")
+
+            actions = module.apply_native_bridges(home=home, project=None, agents=["codex"])
+
+            bridge = home / ".codex" / "skills" / "shared-only"
+            self.assertTrue(bridge.is_symlink())
+            self.assertEqual(bridge.resolve(), (home / ".agents" / "skills" / "shared-only").resolve())
+            self.assertTrue(any(action["action"] == "replace-identical-copy-with-native-bridge" for action in actions))
+
+    def test_cli_can_apply_native_bridges(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "repo"
+            home.mkdir()
+            project.mkdir()
+            write_skill(home / ".agents" / "skills", "global-shared", "global-shared", "Use when managing general notes")
+            write_skill(project / ".agents" / "skills", "project-shared", "project-shared", "Use when managing project notes")
+
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(
+                    module.main(
+                        [
+                            "--home",
+                            str(home),
+                            "--project",
+                            str(project),
+                            "--apply-native-bridges",
+                            "--agent",
+                            "claude",
+                            "--format",
+                            "json",
+                        ]
+                    ),
+                    0,
+                )
+
+            self.assertTrue((home / ".claude" / "skills" / "global-shared").is_symlink())
+            self.assertTrue((project / ".claude" / "skills" / "project-shared").is_symlink())
+            payload = json.loads(output.getvalue())
+            self.assertTrue(any(action["action"] == "create-native-bridge" for action in payload["layout_actions"]))
+
+    def test_cli_native_bridges_can_target_project_scope_only(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "repo"
+            home.mkdir()
+            project.mkdir()
+            write_skill(home / ".agents" / "skills", "global-shared", "global-shared", "Use when managing general notes")
+            write_skill(project / ".agents" / "skills", "project-shared", "project-shared", "Use when managing project notes")
+
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(
+                    module.main(
+                        [
+                            "--home",
+                            str(home),
+                            "--project",
+                            str(project),
+                            "--apply-native-bridges",
+                            "--bridge-scope",
+                            "project",
+                            "--agent",
+                            "claude",
+                            "--format",
+                            "json",
+                        ]
+                    ),
+                    0,
+                )
+
+            self.assertFalse((home / ".claude" / "skills" / "global-shared").exists())
+            self.assertTrue((project / ".claude" / "skills" / "project-shared").is_symlink())
+            payload = json.loads(output.getvalue())
+            scopes = {action.get("scope") for action in payload["layout_actions"]}
+            self.assertEqual(scopes, {"project"})
+
+    def test_install_can_apply_native_bridges(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "repo"
+            config_path = Path(tmp) / "config.json"
+            home.mkdir()
+            project.mkdir()
+            write_skill(home / ".agents" / "skills", "global-shared", "global-shared", "Use when managing general notes")
+            write_skill(project / ".agents" / "skills", "project-shared", "project-shared", "Use when managing project notes")
+
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(
+                    module.main(
+                        [
+                            "install",
+                            "codex",
+                            "claude",
+                            "--home",
+                            str(home),
+                            "--project",
+                            str(project),
+                            "--config",
+                            str(config_path),
+                            "--native-bridges",
+                        ]
+                    ),
+                    0,
+                )
+
+            self.assertTrue((home / ".codex" / "skills" / "global-shared").is_symlink())
+            self.assertTrue((home / ".claude" / "skills" / "global-shared").is_symlink())
+            self.assertTrue((project / ".codex" / "skills" / "project-shared").is_symlink())
+            self.assertTrue((project / ".claude" / "skills" / "project-shared").is_symlink())
+            self.assertIn("Native bridge actions:", output.getvalue())
+
+
+if __name__ == "__main__":
+    unittest.main()

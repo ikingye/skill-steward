@@ -1,0 +1,4 @@
+interface:
+  display_name: "Skill Steward"
+  short_description: "Audit and manage shared and agent-specific skills."
+  default_prompt: "Audit my global and project skills, then recommend duplicate cleanup and scope moves without deleting anything."
