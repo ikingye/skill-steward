@@ -144,7 +144,7 @@ python3 scripts/skill_steward.py skills quality
 python3 scripts/skill_steward.py skills quality --project "$PWD" --format json
 ```
 
-The quality report assigns each skill a score from 0 to 100 and flags broad descriptions, hardcoded local absolute paths, non-executable shebang scripts, and shared versus agent-specific placement drift. Treat these findings as review prompts; fix the skill text or move the skill before deleting it.
+Text output shows only skills with issues by default; use `--all` to include clean skills. The quality report assigns each skill a score from 0 to 100 and flags broad descriptions, hardcoded local absolute paths, non-executable shebang scripts, and shared versus agent-specific placement drift. Treat these findings as review prompts; fix the skill text or move the skill before deleting it.
 
 ## Safe Cleanup Rules
 

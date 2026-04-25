@@ -169,6 +169,8 @@ python3 skill-steward/scripts/skill_steward.py skills quality
 python3 skill-steward/scripts/skill_steward.py skills quality --project "$PWD" --format json
 ```
 
+Text output shows only skills with issues by default. Use `--all` to include clean skills.
+
 The quality report assigns each skill a `quality_score` from 0 to 100 and lists issue codes such as:
 
 - `broad-description`: the description is too generic to help an agent decide when to load it

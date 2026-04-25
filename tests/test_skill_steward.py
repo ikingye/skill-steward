@@ -481,6 +481,28 @@ class ManageAgentSkillsTest(unittest.TestCase):
             self.assertEqual(payload["quality"][0]["skill"], "bad-skill")
             self.assertLess(payload["quality"][0]["quality_score"], 100)
 
+    def test_skills_cli_quality_text_shows_only_issues_by_default(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            write_skill(home / ".agents" / "skills", "good-skill", "good-skill", "Use when reviewing package releases")
+            write_skill(home / ".agents" / "skills", "bad-skill", "bad-skill", "Use when doing anything")
+
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(module.main(["skills", "quality", "--home", str(home)]), 0)
+
+            text = output.getvalue()
+            self.assertIn("bad-skill", text)
+            self.assertNotIn("good-skill", text)
+
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(module.main(["skills", "quality", "--home", str(home), "--all"]), 0)
+
+            self.assertIn("good-skill", output.getvalue())
+
     def test_multiline_description_is_parsed_for_quality_checks(self):
         module = load_module()
 

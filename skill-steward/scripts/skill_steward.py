@@ -1999,6 +1999,7 @@ def handle_skills_command(argv: list[str]) -> int:
     add_common_options(cleanup_parser)
 
     quality_parser = subparsers.add_parser("quality", help="Check skill metadata, placement, paths, and helper scripts.")
+    quality_parser.add_argument("--all", action="store_true", help="Show skills without quality issues in text output.")
     add_common_options(quality_parser)
 
     args = parser.parse_args(argv)
@@ -2055,7 +2056,10 @@ def handle_skills_command(argv: list[str]) -> int:
             print(f"- {item['skill']}: {item['recommendation']} - {item['reason']}")
     elif "quality" in payload:
         print("Skill Quality")
-        for item in payload["quality"]:
+        rows = payload["quality"] if getattr(args, "all", False) else [item for item in payload["quality"] if item["issues"]]
+        if not rows:
+            print("- no quality issues found")
+        for item in rows:
             codes = ", ".join(issue["code"] for issue in item["issues"]) or "ok"
             print(f"- {item['skill']}: score={item['quality_score']} issues={codes}")
     else:
