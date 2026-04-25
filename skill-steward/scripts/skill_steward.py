@@ -124,6 +124,19 @@ SKIP_LOG_DIRS = {
     "skills",
     "vendor_imports",
 }
+BROAD_DESCRIPTION_TERMS = (
+    "doing anything",
+    "anything",
+    "everything",
+    "all tasks",
+    "any task",
+    "general help",
+    "helping users",
+    "various tasks",
+)
+HARDCODED_ABSOLUTE_PATH_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_.-])(?:/Users|/home|/var/folders)/[^\s`'\"<>)]*"
+)
 
 
 @dataclass(frozen=True)
@@ -145,14 +158,37 @@ def parse_frontmatter(skill_file: Path) -> dict[str, str]:
     if len(parts) < 3:
         return {}
     values: dict[str, str] = {}
-    for line in parts[1].splitlines():
+    lines = parts[1].splitlines()
+    index = 0
+    while index < len(lines):
+        line = lines[index]
         if ":" not in line:
+            index += 1
             continue
         key, value = line.split(":", 1)
         key = key.strip()
-        value = value.strip().strip("\"'")
+        value = value.strip()
         if key in {"name", "description"}:
-            values[key] = value
+            if value.startswith("|") or value.startswith(">"):
+                index += 1
+                block_lines: list[str] = []
+                while index < len(lines):
+                    block_line = lines[index]
+                    if block_line.strip() == "":
+                        block_lines.append("")
+                        index += 1
+                        continue
+                    if not block_line.startswith((" ", "\t")):
+                        break
+                    block_lines.append(block_line.lstrip())
+                    index += 1
+                text = "\n".join(block_lines).strip()
+                if value.startswith(">"):
+                    text = " ".join(part.strip() for part in text.splitlines())
+                values[key] = text
+                continue
+            values[key] = value.strip("\"'")
+        index += 1
     return values
 
 
@@ -1458,6 +1494,127 @@ def cleanup_recommendation_report(
     )
 
 
+def add_quality_issue(issues: list[dict], code: str, severity: str, detail: str, penalty: int) -> None:
+    issues.append({"code": code, "severity": severity, "detail": detail, "penalty": penalty})
+
+
+def description_is_broad(description: str) -> bool:
+    value = description.strip().lower()
+    if not value:
+        return False
+    if len(value) < 24:
+        return True
+    return any(term in value for term in BROAD_DESCRIPTION_TERMS)
+
+
+def non_executable_shebang_scripts(skill_dir: Path) -> list[str]:
+    scripts_dir = skill_dir / "scripts"
+    if not scripts_dir.is_dir():
+        return []
+
+    scripts: list[str] = []
+    for path in sorted(scripts_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        try:
+            with path.open("rb") as handle:
+                first_line = handle.readline(128)
+        except OSError:
+            continue
+        if first_line.startswith(b"#!") and not os.access(path, os.X_OK):
+            scripts.append(str(path.relative_to(skill_dir)))
+    return scripts
+
+
+def skill_quality_report(skills: list[dict]) -> list[dict]:
+    rows: list[dict] = []
+    for skill in skills:
+        issues: list[dict] = []
+        path = Path(skill["path"])
+        description = skill.get("description", "")
+        skill_file = path / "SKILL.md"
+        try:
+            skill_text = skill_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            skill_text = ""
+
+        if not description.strip():
+            add_quality_issue(
+                issues,
+                "missing-description",
+                "high",
+                "SKILL.md frontmatter should include a trigger-focused description.",
+                30,
+            )
+        elif description_is_broad(description):
+            add_quality_issue(
+                issues,
+                "broad-description",
+                "medium",
+                "Description is too broad to help agents decide when to load the skill.",
+                20,
+            )
+
+        if HARDCODED_ABSOLUTE_PATH_PATTERN.search(skill_text):
+            add_quality_issue(
+                issues,
+                "hardcoded-absolute-path",
+                "medium",
+                "Skill text contains a machine-specific absolute path; prefer $HOME, relative paths, or placeholders.",
+                15,
+            )
+
+        scripts = non_executable_shebang_scripts(path)
+        if scripts:
+            add_quality_issue(
+                issues,
+                "non-executable-script",
+                "medium",
+                f"Shebang script is not executable: {', '.join(scripts[:5])}.",
+                15,
+            )
+
+        metadata_agent_mentions = set(skill.get("metadata_agent_mentions", []))
+        content_agent_mentions = set(skill.get("content_agent_mentions", []))
+        desired_agent = skill.get("desired_agent")
+        if skill["agent"] == "shared" and desired_agent is not None:
+            add_quality_issue(
+                issues,
+                "agent-specific-in-shared",
+                "medium",
+                "Shared skill metadata appears to target one agent; consider moving it to that agent's skill directory.",
+                15,
+            )
+        elif (
+            skill["agent"] != "shared"
+            and desired_agent is None
+            and skill["agent"] not in metadata_agent_mentions
+            and skill["agent"] not in content_agent_mentions
+        ):
+            add_quality_issue(
+                issues,
+                "agent-neutral-in-agent-specific",
+                "low",
+                "Agent-specific skill does not advertise agent-specific behavior; consider moving it to shared skills.",
+                10,
+            )
+
+        score = max(0, 100 - sum(issue["penalty"] for issue in issues))
+        rows.append(
+            {
+                "skill": skill["name"],
+                "path": skill["path"],
+                "scope": skill["scope"],
+                "agent": skill["agent"],
+                "protected": skill["protected"],
+                "quality_score": score,
+                "issues": issues,
+            }
+        )
+
+    return sorted(rows, key=lambda item: (item["quality_score"], item["skill"], item["path"]))
+
+
 def build_recommendations(skills: list[dict], duplicates: list[dict], usage: list[dict], days: int) -> list[dict]:
     recommendations: list[dict] = []
     usage_by_name = {item["name"]: item for item in usage}
@@ -1556,6 +1713,7 @@ def build_report(
     usage_windows = usage_window_report(skills, logs, current)
     usage_confidence = usage_confidence_report(skills, logs, days, current)
     cleanup_recommendations = cleanup_recommendation_report(skills, usage_confidence, current, stale_days)
+    quality = skill_quality_report(skills)
     recommendations = build_recommendations(skills, duplicates, usage, days)
     return {
         "generated_at": current.isoformat(),
@@ -1570,6 +1728,7 @@ def build_report(
         "usage_windows": usage_windows,
         "usage_confidence": usage_confidence,
         "cleanup_recommendations": cleanup_recommendations,
+        "quality": quality,
         "recommendations": recommendations,
     }
 
@@ -1581,6 +1740,7 @@ def print_text(report: dict) -> None:
         print(f"Project: {report['project']}")
     print(f"Skills: {len(report['skills'])}")
     print(f"Duplicates: {len(report['duplicates'])}")
+    print(f"Quality Issues: {sum(1 for item in report.get('quality', []) if item.get('issues'))}")
     print(f"Recommendations: {len(report['recommendations'])}")
     print()
 
@@ -1642,6 +1802,18 @@ def print_text(report: dict) -> None:
             )
         print()
 
+    quality_issues = [item for item in report.get("quality", []) if item["issues"]]
+    if quality_issues:
+        print("Skill Quality")
+        name_width = max([len("Skill"), *[len(item["skill"]) for item in quality_issues]])
+        print(f"{'Skill':<{name_width}} {'Score':>5} Issues")
+        print(f"{'-' * name_width} {'-' * 5} ------")
+        for item in quality_issues[:40]:
+            codes = ", ".join(issue["code"] for issue in item["issues"])
+            print(f"{item['skill']:<{name_width}} {item['quality_score']:>5} {codes}")
+            print(f"  path: {item['path']}")
+        print()
+
     if report.get("cleanup_recommendations"):
         print("Cleanup Recommendations")
         for group in ("safe-to-remove", "review-manually", "keep", "protected-or-skip"):
@@ -1683,6 +1855,15 @@ def html_table(headers: list[str], rows: list[list[object]]) -> str:
 
 
 def render_html_report(report: dict) -> str:
+    quality_rows = [
+        [
+            item["skill"],
+            item["quality_score"],
+            ", ".join(issue["code"] for issue in item["issues"]) or "ok",
+            item["path"],
+        ]
+        for item in report.get("quality", [])
+    ]
     cleanup_rows = [
         [
             item["skill"],
@@ -1757,8 +1938,11 @@ code{background:#eef2ff;padding:2px 4px;border-radius:4px}
             "<div class=\"cards\">",
             f"<div class=\"card\"><div>Skills</div><div class=\"value\">{len(report.get('skills', []))}</div></div>",
             f"<div class=\"card\"><div>Duplicates</div><div class=\"value\">{len(report.get('duplicates', []))}</div></div>",
+            f"<div class=\"card\"><div>Quality Issues</div><div class=\"value\">{sum(1 for item in report.get('quality', []) if item.get('issues'))}</div></div>",
             f"<div class=\"card\"><div>Cleanup Items</div><div class=\"value\">{len(report.get('cleanup_recommendations', []))}</div></div>",
             "</div>",
+            "<h2>Skill Quality</h2>",
+            html_table(["Skill", "Score", "Issues", "Path"], quality_rows),
             "<h2>Cleanup Recommendations</h2>",
             html_table(["Skill", "Recommendation", "Likely Uses", "Mentions", "Confidence", "Last Seen", "Reason"], cleanup_rows),
             "<h2>Usage by Window</h2>",
@@ -1814,6 +1998,9 @@ def handle_skills_command(argv: list[str]) -> int:
     cleanup_parser.add_argument("--log-root", action="append", type=Path, help="Additional or explicit log root to scan.")
     add_common_options(cleanup_parser)
 
+    quality_parser = subparsers.add_parser("quality", help="Check skill metadata, placement, paths, and helper scripts.")
+    add_common_options(quality_parser)
+
     args = parser.parse_args(argv)
     try:
         if args.skills_command == "quarantine":
@@ -1843,6 +2030,14 @@ def handle_skills_command(argv: list[str]) -> int:
                 "home": report["home"],
                 "project": report["project"],
             }
+        elif args.skills_command == "quality":
+            report = build_report(home=args.home, project=args.project, log_roots=[], stale_days=args.stale_days)
+            payload = {
+                "quality": report["quality"],
+                "generated_at": report["generated_at"],
+                "home": report["home"],
+                "project": report["project"],
+            }
         else:
             parser.error(f"unknown command: {args.skills_command}")
     except LayoutError as exc:
@@ -1858,6 +2053,11 @@ def handle_skills_command(argv: list[str]) -> int:
         print("Cleanup Plan")
         for item in payload["cleanup_recommendations"]:
             print(f"- {item['skill']}: {item['recommendation']} - {item['reason']}")
+    elif "quality" in payload:
+        print("Skill Quality")
+        for item in payload["quality"]:
+            codes = ", ".join(issue["code"] for issue in item["issues"]) or "ok"
+            print(f"- {item['skill']}: score={item['quality_score']} issues={codes}")
     else:
         for item in payload["trash"]:
             print(

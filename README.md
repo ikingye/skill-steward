@@ -13,6 +13,7 @@ It helps agents:
 - scan local session logs for approximate usage and effectiveness signals
 - summarize each skill's approximate usage over the last 24 hours, 7 days, and 30 days
 - classify usage evidence as used, likely, or mention-only with a confidence score
+- check skill quality issues such as broad descriptions, hardcoded local paths, placement drift, and non-executable helper scripts
 - suggest stale, duplicate, or misplaced skills for review
 
 The report mode is non-destructive by default. `--apply-project-layout` intentionally changes project directories to match the canonical hidden layout.
@@ -158,6 +159,22 @@ python3 skill-steward/scripts/skill_steward.py event likely skill-steward --agen
 ```
 
 Events are appended to `~/.agents/skill-steward/events.jsonl` and included in later audits automatically.
+
+### Quality Checks
+
+Run a static quality check over global or project skills:
+
+```bash
+python3 skill-steward/scripts/skill_steward.py skills quality
+python3 skill-steward/scripts/skill_steward.py skills quality --project "$PWD" --format json
+```
+
+The quality report assigns each skill a `quality_score` from 0 to 100 and lists issue codes such as:
+
+- `broad-description`: the description is too generic to help an agent decide when to load it
+- `hardcoded-absolute-path`: the skill contains a machine-specific path such as `/Users/...`
+- `non-executable-script`: a helper script has a shebang but is not executable
+- `agent-specific-in-shared` or `agent-neutral-in-agent-specific`: the skill appears to be in the wrong shared or native directory
 
 ### Global Audit
 

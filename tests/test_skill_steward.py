@@ -433,6 +433,81 @@ class ManageAgentSkillsTest(unittest.TestCase):
             self.assertEqual(confidence["alpha-skill"]["success_signals"], 1)
             self.assertEqual(confidence["alpha-skill"]["by_agent"]["codex"]["strong_signals"], 1)
 
+    def test_quality_report_flags_broad_paths_and_script_permissions(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            good = write_skill(
+                home / ".agents" / "skills",
+                "good-skill",
+                "good-skill",
+                "Use when reviewing a Python package release checklist",
+            )
+            bad = write_skill(
+                home / ".agents" / "skills",
+                "bad-skill",
+                "bad-skill",
+                "Use when doing anything",
+                body="Run /Users/alice/private/tool.py before continuing.",
+            )
+            script_dir = bad / "scripts"
+            script_dir.mkdir()
+            (script_dir / "run.sh").write_text("#!/bin/sh\necho hi\n", encoding="utf-8")
+
+            report = module.build_report(home=home, project=None, days=90, log_roots=[])
+            quality = {item["skill"]: item for item in report["quality"]}
+
+            self.assertEqual(quality["good-skill"]["quality_score"], 100)
+            self.assertLess(quality["bad-skill"]["quality_score"], quality["good-skill"]["quality_score"])
+            issue_codes = {issue["code"] for issue in quality["bad-skill"]["issues"]}
+            self.assertIn("broad-description", issue_codes)
+            self.assertIn("hardcoded-absolute-path", issue_codes)
+            self.assertIn("non-executable-script", issue_codes)
+            self.assertTrue((good / "SKILL.md").is_file())
+
+    def test_skills_cli_quality_outputs_json(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            write_skill(home / ".agents" / "skills", "bad-skill", "bad-skill", "Use when doing anything")
+
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(module.main(["skills", "quality", "--home", str(home), "--format", "json"]), 0)
+
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["quality"][0]["skill"], "bad-skill")
+            self.assertLess(payload["quality"][0]["quality_score"], 100)
+
+    def test_multiline_description_is_parsed_for_quality_checks(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            skill_dir = home / ".agents" / "skills" / "block-skill"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                "\n".join(
+                    [
+                        "---",
+                        "name: block-skill",
+                        "description: |",
+                        "  Use when reviewing Python package release checklists before publishing.",
+                        "---",
+                        "",
+                        "# Block Skill",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            report = module.build_report(home=home, project=None, days=90, log_roots=[])
+            quality = {item["skill"]: item for item in report["quality"]}
+
+            self.assertEqual(quality["block-skill"]["quality_score"], 100)
+
     def test_symlinked_agent_root_does_not_create_false_duplicate(self):
         module = load_module()
 

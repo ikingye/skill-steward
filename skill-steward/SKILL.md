@@ -135,6 +135,17 @@ Events are appended to `~/.agents/skill-steward/events.jsonl` and included in fu
 
 Treat these as triage signals, not truth. A high count may include discussions about a skill rather than real activation. A low count may mean an agent does not log skill use explicitly. Use the ranking to choose what to inspect manually.
 
+## Quality Checks
+
+Check skill quality before publishing or pruning:
+
+```bash
+python3 scripts/skill_steward.py skills quality
+python3 scripts/skill_steward.py skills quality --project "$PWD" --format json
+```
+
+The quality report assigns each skill a score from 0 to 100 and flags broad descriptions, hardcoded local absolute paths, non-executable shebang scripts, and shared versus agent-specific placement drift. Treat these findings as review prompts; fix the skill text or move the skill before deleting it.
+
 ## Safe Cleanup Rules
 
 - Never keep the same shared skill copied into multiple agent-specific directories just to make loading work; configure the agent loader instead.
