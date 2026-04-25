@@ -1520,8 +1520,10 @@ def cleanup_recommendation_report(
     )
 
 
-def add_quality_issue(issues: list[dict], code: str, severity: str, detail: str, penalty: int) -> None:
-    issues.append({"code": code, "severity": severity, "detail": detail, "penalty": penalty})
+def add_quality_issue(issues: list[dict], code: str, severity: str, detail: str, penalty: int, **fields: object) -> None:
+    issue = {"code": code, "severity": severity, "detail": detail, "penalty": penalty}
+    issue.update(fields)
+    issues.append(issue)
 
 
 def policy_string_set(policy: dict, key: str) -> set[str]:
@@ -1619,6 +1621,8 @@ def skill_quality_report(skills: list[dict], policy: dict | None = None) -> list
                 "medium",
                 f"Shebang script is not executable: {', '.join(scripts[:5])}.",
                 15,
+                paths=scripts,
+                fix="chmod-executable",
             )
 
         metadata_agent_mentions = set(skill.get("metadata_agent_mentions", []))
@@ -1668,6 +1672,70 @@ def skill_quality_report(skills: list[dict], policy: dict | None = None) -> list
         )
 
     return sorted(rows, key=lambda item: (item["quality_score"], item["skill"], item["path"]))
+
+
+def fix_quality_issues(quality: list[dict]) -> list[dict]:
+    actions: list[dict] = []
+    for item in quality:
+        for issue in item.get("issues", []):
+            if issue.get("code") != "non-executable-script":
+                continue
+            if item.get("protected"):
+                actions.append(
+                    {
+                        "action": "skip-protected-fix",
+                        "skill": item["skill"],
+                        "issue": issue["code"],
+                        "path": item["path"],
+                    }
+                )
+                continue
+
+            for rel_path in issue.get("paths", []):
+                script = Path(item["path"]) / rel_path
+                if script.is_symlink():
+                    actions.append(
+                        {
+                            "action": "skip-symlink-script",
+                            "skill": item["skill"],
+                            "path": str(script),
+                        }
+                    )
+                    continue
+                if not script.is_file():
+                    actions.append(
+                        {
+                            "action": "script-not-found",
+                            "skill": item["skill"],
+                            "path": str(script),
+                        }
+                    )
+                    continue
+                try:
+                    mode_before = script.stat().st_mode
+                    mode_after = mode_before | 0o111
+                    if mode_after != mode_before:
+                        script.chmod(mode_after)
+                except OSError as exc:
+                    actions.append(
+                        {
+                            "action": "chmod-failed",
+                            "skill": item["skill"],
+                            "path": str(script),
+                            "error": str(exc),
+                        }
+                    )
+                    continue
+                actions.append(
+                    {
+                        "action": "chmod-executable",
+                        "skill": item["skill"],
+                        "path": str(script),
+                        "mode_before": oct(mode_before & 0o777),
+                        "mode_after": oct(mode_after & 0o777),
+                    }
+                )
+    return actions
 
 
 def build_recommendations(skills: list[dict], duplicates: list[dict], usage: list[dict], days: int) -> list[dict]:
@@ -2067,6 +2135,11 @@ def handle_skills_command(argv: list[str]) -> int:
 
     quality_parser = subparsers.add_parser("quality", help="Check skill metadata, placement, paths, and helper scripts.")
     quality_parser.add_argument("--all", action="store_true", help="Show skills without quality issues in text output.")
+    quality_parser.add_argument(
+        "--fix",
+        action="store_true",
+        help="Apply safe automatic fixes, currently chmod +x for non-protected shebang scripts.",
+    )
     add_common_options(quality_parser)
 
     args = parser.parse_args(argv)
@@ -2101,6 +2174,7 @@ def handle_skills_command(argv: list[str]) -> int:
                 "policy_path": report["policy_path"],
             }
         elif args.skills_command == "quality":
+            fix_actions: list[dict] = []
             report = build_report(
                 home=args.home,
                 project=args.project,
@@ -2108,8 +2182,18 @@ def handle_skills_command(argv: list[str]) -> int:
                 stale_days=args.stale_days,
                 policy_path=args.policy,
             )
+            if args.fix:
+                fix_actions = fix_quality_issues(report["quality"])
+                report = build_report(
+                    home=args.home,
+                    project=args.project,
+                    log_roots=[],
+                    stale_days=args.stale_days,
+                    policy_path=args.policy,
+                )
             payload = {
                 "quality": report["quality"],
+                "fix_actions": fix_actions,
                 "generated_at": report["generated_at"],
                 "home": report["home"],
                 "project": report["project"],
@@ -2138,6 +2222,12 @@ def handle_skills_command(argv: list[str]) -> int:
         for item in rows:
             codes = ", ".join(issue["code"] for issue in item["issues"]) or "ok"
             print(f"- {item['skill']}: score={item['quality_score']} issues={codes}")
+        if getattr(args, "fix", False):
+            print("Fix Actions")
+            if not payload["fix_actions"]:
+                print("- no fixable issues found")
+            else:
+                print_actions(payload["fix_actions"])
     else:
         for item in payload["trash"]:
             print(

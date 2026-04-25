@@ -192,6 +192,14 @@ Projects can keep reviewed exceptions in `.skill-steward.json`:
 
 Ignored findings appear in JSON as `ignored_issues` and do not reduce `quality_score`. Use `--policy /path/to/policy.json` to load a policy outside the project root.
 
+Apply safe automatic fixes with `--fix`:
+
+```bash
+python3 skill-steward/scripts/skill_steward.py skills quality --fix
+```
+
+`--fix` currently only adds executable bits to non-protected shebang scripts under `scripts/`. It does not rewrite hardcoded paths, change descriptions, move skills between directories, or modify protected runtime skills.
+
 ### Global Audit
 
 Audit global shared and agent-specific skills:
@@ -286,6 +294,7 @@ These modes mutate the filesystem:
 - `--apply-project-layout` creates hidden project skill directories, writes managed instruction blocks, and removes identical duplicates.
 - `--apply-native-bridges` creates or refreshes symlink bridges from shared skills into managed native agent directories.
 - `skills quarantine`, `skills restore`, and `skills delete --yes` move, restore, or remove skill directories.
+- `skills quality --fix` adds executable bits to fixable non-protected helper scripts.
 
 Plain audit commands without `--apply-*` only report findings.
 

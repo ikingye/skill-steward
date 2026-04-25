@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -550,6 +551,38 @@ class ManageAgentSkillsTest(unittest.TestCase):
             self.assertEqual(quality["bad-skill"]["quality_score"], 100)
             self.assertEqual(quality["bad-skill"]["issues"], [])
             self.assertEqual(quality["bad-skill"]["ignored_issues"][0]["code"], "broad-description")
+
+    def test_skills_cli_quality_fix_makes_shebang_scripts_executable(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            skill = write_skill(
+                home / ".agents" / "skills",
+                "script-skill",
+                "script-skill",
+                "Use when running helper scripts for release checks",
+            )
+            script_dir = skill / "scripts"
+            script_dir.mkdir()
+            script = script_dir / "run.sh"
+            script.write_text("#!/bin/sh\necho hi\n", encoding="utf-8")
+            script.chmod(0o644)
+
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(
+                    module.main(["skills", "quality", "--home", str(home), "--fix", "--format", "json"]),
+                    0,
+                )
+
+            payload = json.loads(output.getvalue())
+
+            self.assertTrue(os.access(script, os.X_OK))
+            self.assertTrue(any(action["action"] == "chmod-executable" for action in payload["fix_actions"]))
+            quality = {item["skill"]: item for item in payload["quality"]}
+            issue_codes = {issue["code"] for issue in quality["script-skill"]["issues"]}
+            self.assertNotIn("non-executable-script", issue_codes)
 
     def test_symlinked_agent_root_does_not_create_false_duplicate(self):
         module = load_module()

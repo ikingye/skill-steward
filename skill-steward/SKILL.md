@@ -154,6 +154,14 @@ For project-specific exceptions, create `<repo>/.skill-steward.json`:
 
 Ignored findings appear in JSON as `ignored_issues` and do not reduce `quality_score`. Use `--policy /path/to/policy.json` to load another policy file.
 
+Apply safe automatic fixes with:
+
+```bash
+python3 scripts/skill_steward.py skills quality --fix
+```
+
+`--fix` currently only adds executable bits to non-protected shebang scripts under `scripts/`. It does not rewrite paths, change descriptions, move skills, or modify protected runtime skills.
+
 ## Safe Cleanup Rules
 
 - Never keep the same shared skill copied into multiple agent-specific directories just to make loading work; configure the agent loader instead.
