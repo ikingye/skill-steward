@@ -132,6 +132,15 @@ Treat these as triage signals, not truth. A high count may include discussions a
 
 ## Cleanup Commands
 
+Generate a cleanup plan first:
+
+```bash
+python3 scripts/skill_steward.py skills cleanup-plan
+python3 scripts/skill_steward.py skills cleanup-plan --format json
+```
+
+The plan groups skills as `safe-to-remove`, `review-manually`, `keep`, or `protected-or-skip`. The default `safe-to-remove` rule is conservative: no actual or likely uses, only weak mentions, low confidence, and last seen at least 30 days ago. Use `--stale-days <days>` to tune the age threshold.
+
 Prefer reversible quarantine before deletion:
 
 ```bash

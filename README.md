@@ -203,6 +203,15 @@ Use `--bridge-scope project`, `--bridge-scope global`, or `--bridge-scope both` 
 
 ### Safe Cleanup
 
+Generate a cleanup plan before moving files:
+
+```bash
+python3 skill-steward/scripts/skill_steward.py skills cleanup-plan
+python3 skill-steward/scripts/skill_steward.py skills cleanup-plan --format json
+```
+
+The plan groups skills as `safe-to-remove`, `review-manually`, `keep`, or `protected-or-skip`. By default, a skill is only considered safe to remove when it has no actual or likely uses, only weak mentions, low confidence, and has not been seen for at least 30 days. Adjust that threshold with `--stale-days`.
+
 Quarantine skills before deleting them permanently:
 
 ```bash

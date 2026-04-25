@@ -309,6 +309,70 @@ class ManageAgentSkillsTest(unittest.TestCase):
             self.assertIn("Confidence", text)
             self.assertIn("alpha-skill", text)
 
+    def test_cleanup_recommendations_group_safe_review_keep_and_protected(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            write_skill(home / ".agents" / "skills", "old-mention", "old-mention", "Use when testing old")
+            write_skill(home / ".agents" / "skills", "recent-used", "recent-used", "Use when testing recent")
+            write_skill(home / ".agents" / "skills", "never-seen", "never-seen", "Use when testing never")
+            write_skill(
+                home / ".codex" / "skills" / "codex-primary-runtime",
+                "spreadsheets",
+                "Excel",
+                "Use when editing spreadsheets",
+            )
+
+            now = datetime(2026, 4, 25, 12, 0, tzinfo=timezone.utc)
+            log_dir = home / ".codex" / "sessions"
+            log_dir.mkdir(parents=True)
+            (log_dir / "session.jsonl").write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "timestamp": (now - timedelta(days=45)).isoformat(),
+                                "text": "old-mention appears in archived notes.",
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": (now - timedelta(hours=2)).isoformat(),
+                                "text": "Using recent-used for this task. Validation passed.",
+                            }
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            report = module.build_report(home=home, project=None, days=90, log_roots=[log_dir], now=now)
+            cleanup = {item["skill"]: item for item in report["cleanup_recommendations"]}
+
+            self.assertEqual(cleanup["old-mention"]["recommendation"], "safe-to-remove")
+            self.assertEqual(cleanup["recent-used"]["recommendation"], "keep")
+            self.assertEqual(cleanup["never-seen"]["recommendation"], "review-manually")
+            self.assertEqual(cleanup["Excel"]["recommendation"], "protected-or-skip")
+
+    def test_skills_cli_cleanup_plan_outputs_json(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            write_skill(home / ".agents" / "skills", "never-seen", "never-seen", "Use when testing never")
+
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(
+                    module.main(["skills", "cleanup-plan", "--home", str(home), "--format", "json"]),
+                    0,
+                )
+
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["cleanup_recommendations"][0]["skill"], "never-seen")
+            self.assertEqual(payload["cleanup_recommendations"][0]["recommendation"], "review-manually")
+
     def test_symlinked_agent_root_does_not_create_false_duplicate(self):
         module = load_module()
 

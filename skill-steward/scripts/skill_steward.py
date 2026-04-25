@@ -1375,6 +1375,76 @@ def usage_confidence_report(
     )
 
 
+def cleanup_recommendation_report(
+    skills: list[dict],
+    usage_confidence: list[dict],
+    now: datetime | None = None,
+    stale_days: int = 30,
+) -> list[dict]:
+    current = normalize_now(now)
+    usage_by_name = {item["name"]: item for item in usage_confidence}
+    rows: list[dict] = []
+
+    for skill in skills:
+        usage = usage_by_name.get(skill["name"], {})
+        last_seen = usage.get("last_seen")
+        last_seen_days_ago = None
+        if last_seen:
+            parsed = parse_timestamp_value(last_seen)
+            if parsed is not None:
+                last_seen_days_ago = round((current.timestamp() - parsed) / 86400, 1)
+
+        base = {
+            "skill": skill["name"],
+            "path": skill["path"],
+            "scope": skill["scope"],
+            "agent": skill["agent"],
+            "protected": skill["protected"],
+            "mentions": usage.get("mentions", 0),
+            "actual_or_likely_uses": usage.get("actual_or_likely_uses", 0),
+            "confidence": usage.get("confidence", 0.0),
+            "event_type": usage.get("event_type", "none"),
+            "last_seen": last_seen,
+            "last_seen_days_ago": last_seen_days_ago,
+        }
+
+        if skill["protected"]:
+            recommendation = "protected-or-skip"
+            reason = "Protected runtime or bundled skill."
+        elif base["mentions"] == 0:
+            recommendation = "review-manually"
+            reason = "No usage evidence found in scanned logs."
+        elif (
+            base["actual_or_likely_uses"] == 0
+            and base["confidence"] <= 0.25
+            and last_seen_days_ago is not None
+            and last_seen_days_ago >= stale_days
+        ):
+            recommendation = "safe-to-remove"
+            reason = f"Only weak mentions found and last seen at least {stale_days} days ago."
+        elif base["actual_or_likely_uses"] == 0 or base["confidence"] < 0.4:
+            recommendation = "review-manually"
+            reason = "Low-confidence usage evidence."
+        else:
+            recommendation = "keep"
+            reason = "Recent or credible usage evidence found."
+
+        base["recommendation"] = recommendation
+        base["reason"] = reason
+        rows.append(base)
+
+    order = {"safe-to-remove": 0, "review-manually": 1, "keep": 2, "protected-or-skip": 3}
+    return sorted(
+        rows,
+        key=lambda item: (
+            order[item["recommendation"]],
+            -float(item["last_seen_days_ago"] or -1),
+            item["skill"],
+            item["path"],
+        ),
+    )
+
+
 def build_recommendations(skills: list[dict], duplicates: list[dict], usage: list[dict], days: int) -> list[dict]:
     recommendations: list[dict] = []
     usage_by_name = {item["name"]: item for item in usage}
@@ -1461,6 +1531,7 @@ def build_report(
     days: int = 90,
     log_roots: list[Path] | None = None,
     now: datetime | None = None,
+    stale_days: int = 30,
 ) -> dict:
     current = normalize_now(now)
     home = (home or Path.home()).expanduser().resolve()
@@ -1471,6 +1542,7 @@ def build_report(
     usage = usage_report(skills, logs, days, current)
     usage_windows = usage_window_report(skills, logs, current)
     usage_confidence = usage_confidence_report(skills, logs, days, current)
+    cleanup_recommendations = cleanup_recommendation_report(skills, usage_confidence, current, stale_days)
     recommendations = build_recommendations(skills, duplicates, usage, days)
     return {
         "generated_at": current.isoformat(),
@@ -1484,6 +1556,7 @@ def build_report(
         "usage": usage,
         "usage_windows": usage_windows,
         "usage_confidence": usage_confidence,
+        "cleanup_recommendations": cleanup_recommendations,
         "recommendations": recommendations,
     }
 
@@ -1556,6 +1629,22 @@ def print_text(report: dict) -> None:
             )
         print()
 
+    if report.get("cleanup_recommendations"):
+        print("Cleanup Recommendations")
+        for group in ("safe-to-remove", "review-manually", "keep", "protected-or-skip"):
+            items = [item for item in report["cleanup_recommendations"] if item["recommendation"] == group]
+            if not items:
+                continue
+            print(f"{group}: {len(items)}")
+            for item in items[:20]:
+                print(
+                    f"- {item['skill']}: uses={item['actual_or_likely_uses']} "
+                    f"mentions={item['mentions']} confidence={item['confidence']:.2f} "
+                    f"last_seen={item['last_seen'] or 'never'}"
+                )
+                print(f"  reason: {item['reason']}")
+        print()
+
     if report["recommendations"]:
         print("Recommendations")
         for item in report["recommendations"][:40]:
@@ -1575,12 +1664,14 @@ def handle_skills_command(argv: list[str]) -> int:
     parser.add_argument("--home", type=Path, default=Path.home(), help="Home directory.")
     parser.add_argument("--project", type=Path, help="Optional project directory.")
     parser.add_argument("--format", choices=("text", "json"), default="text", help="Output format.")
+    parser.add_argument("--stale-days", type=int, default=30, help="Age threshold for safe-to-remove suggestions.")
     subparsers = parser.add_subparsers(dest="skills_command", required=True)
 
     def add_common_options(subparser: argparse.ArgumentParser) -> None:
         subparser.add_argument("--home", type=Path, default=argparse.SUPPRESS, help="Home directory.")
         subparser.add_argument("--project", type=Path, default=argparse.SUPPRESS, help="Optional project directory.")
         subparser.add_argument("--format", choices=("text", "json"), default=argparse.SUPPRESS, help="Output format.")
+        subparser.add_argument("--stale-days", type=int, default=argparse.SUPPRESS, help="Age threshold for safe-to-remove suggestions.")
 
     quarantine_parser = subparsers.add_parser("quarantine", help="Move skills to the local skill-steward trash.")
     quarantine_parser.add_argument("skills", nargs="+", help="Skill names or folder names to quarantine.")
@@ -1598,6 +1689,11 @@ def handle_skills_command(argv: list[str]) -> int:
     list_trash_parser = subparsers.add_parser("list-trash", help="List quarantined skills.")
     add_common_options(list_trash_parser)
 
+    cleanup_parser = subparsers.add_parser("cleanup-plan", help="Suggest skills to remove, review, keep, or skip.")
+    cleanup_parser.add_argument("--days", type=int, default=90, help="Log scan window in days.")
+    cleanup_parser.add_argument("--log-root", action="append", type=Path, help="Additional or explicit log root to scan.")
+    add_common_options(cleanup_parser)
+
     args = parser.parse_args(argv)
     try:
         if args.skills_command == "quarantine":
@@ -1613,6 +1709,20 @@ def handle_skills_command(argv: list[str]) -> int:
             payload = {"actions": actions}
         elif args.skills_command == "list-trash":
             payload = {"trash": load_trash_manifests(args.home)}
+        elif args.skills_command == "cleanup-plan":
+            report = build_report(
+                home=args.home,
+                project=args.project,
+                days=args.days,
+                log_roots=args.log_root,
+                stale_days=args.stale_days,
+            )
+            payload = {
+                "cleanup_recommendations": report["cleanup_recommendations"],
+                "generated_at": report["generated_at"],
+                "home": report["home"],
+                "project": report["project"],
+            }
         else:
             parser.error(f"unknown command: {args.skills_command}")
     except LayoutError as exc:
@@ -1624,6 +1734,10 @@ def handle_skills_command(argv: list[str]) -> int:
         print()
     elif "actions" in payload:
         print_actions(payload["actions"])
+    elif "cleanup_recommendations" in payload:
+        print("Cleanup Plan")
+        for item in payload["cleanup_recommendations"]:
+            print(f"- {item['skill']}: {item['recommendation']} - {item['reason']}")
     else:
         for item in payload["trash"]:
             print(
@@ -1769,6 +1883,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--home", type=Path, default=Path.home(), help="Home directory to scan.")
     parser.add_argument("--project", type=Path, help="Project directory to scan for project-level skills.")
     parser.add_argument("--days", type=int, default=90, help="Only scan logs modified in the last N days; 0 scans all.")
+    parser.add_argument("--stale-days", type=int, default=30, help="Age threshold for safe-to-remove cleanup suggestions.")
     parser.add_argument("--log-root", action="append", type=Path, help="Additional or explicit log root to scan.")
     parser.add_argument("--config", type=Path, help="Config file path for managed agents.")
     parser.add_argument(
@@ -1820,7 +1935,13 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     log_roots = args.log_root if args.log_root else None
-    report = build_report(home=args.home, project=args.project, days=args.days, log_roots=log_roots)
+    report = build_report(
+        home=args.home,
+        project=args.project,
+        days=args.days,
+        log_roots=log_roots,
+        stale_days=args.stale_days,
+    )
     if layout_actions:
         report["layout_actions"] = layout_actions
     if args.format == "json":
