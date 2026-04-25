@@ -107,6 +107,10 @@ python3 scripts/skill_steward.py --home "$HOME" --project "$PWD" --format json >
 
 The script scans known local session/history roots plus any `--log-root` paths. It counts exact skill-name mentions by agent and computes an approximate effectiveness score from nearby positive and negative terms.
 
+The text report includes a `Usage by Window` table for each skill with approximate counts over the last 24 hours, 7 days, and 30 days. JSON output exposes the same data as `usage_windows`, including per-agent breakdowns.
+
+When log lines contain timestamps, the script uses those timestamps for windowed counts. Otherwise it falls back to the log file modification time.
+
 Treat these as triage signals, not truth. A high count may include discussions about a skill rather than real activation. A low count may mean an agent does not log skill use explicitly. Use the ranking to choose what to inspect manually.
 
 ## Safe Cleanup Rules

@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from datetime import datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
 
@@ -134,6 +135,90 @@ class ManageAgentSkillsTest(unittest.TestCase):
             self.assertEqual(usage["skill-steward"]["by_agent"]["codex"], 2)
             self.assertGreater(usage["skill-steward"]["effectiveness_score"], 0.5)
             self.assertEqual(usage["unused-skill"]["negative_signals"], 1)
+
+    def test_usage_windows_count_24h_7d_and_30d_from_log_timestamps(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            write_skill(home / ".agents" / "skills", "alpha-skill", "alpha-skill", "Use when testing alpha")
+            write_skill(home / ".agents" / "skills", "beta-skill", "beta-skill", "Use when testing beta")
+
+            now = datetime(2026, 4, 25, 12, 0, tzinfo=timezone.utc)
+            log_dir = home / ".codex" / "sessions"
+            log_dir.mkdir(parents=True)
+            (log_dir / "session.jsonl").write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "timestamp": (now - timedelta(hours=2)).isoformat(),
+                                "text": "Using alpha-skill.",
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": (now - timedelta(days=3)).isoformat(),
+                                "text": "Using alpha-skill and beta-skill.",
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": (now - timedelta(days=10)).isoformat(),
+                                "text": "Using alpha-skill.",
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": (now - timedelta(days=40)).isoformat(),
+                                "text": "Using alpha-skill and beta-skill.",
+                            }
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            report = module.build_report(home=home, project=None, days=90, log_roots=[log_dir], now=now)
+            usage_windows = {item["name"]: item for item in report["usage_windows"]}
+
+            self.assertEqual(usage_windows["alpha-skill"]["last_24h"], 1)
+            self.assertEqual(usage_windows["alpha-skill"]["last_7d"], 2)
+            self.assertEqual(usage_windows["alpha-skill"]["last_30d"], 3)
+            self.assertEqual(usage_windows["beta-skill"]["last_24h"], 0)
+            self.assertEqual(usage_windows["beta-skill"]["last_7d"], 1)
+            self.assertEqual(usage_windows["beta-skill"]["last_30d"], 1)
+
+    def test_text_report_prints_usage_windows_table(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            write_skill(home / ".agents" / "skills", "alpha-skill", "alpha-skill", "Use when testing alpha")
+            now = datetime(2026, 4, 25, 12, 0, tzinfo=timezone.utc)
+            log_dir = home / ".codex" / "sessions"
+            log_dir.mkdir(parents=True)
+            (log_dir / "session.jsonl").write_text(
+                json.dumps(
+                    {
+                        "timestamp": (now - timedelta(hours=1)).isoformat(),
+                        "text": "Using alpha-skill.",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            report = module.build_report(home=home, project=None, days=90, log_roots=[log_dir], now=now)
+            output = StringIO()
+            with redirect_stdout(output):
+                module.print_text(report)
+
+            text = output.getvalue()
+            self.assertIn("Usage by Window", text)
+            self.assertIn("24h", text)
+            self.assertIn("7d", text)
+            self.assertIn("30d", text)
+            self.assertIn("alpha-skill", text)
 
     def test_symlinked_agent_root_does_not_create_false_duplicate(self):
         module = load_module()

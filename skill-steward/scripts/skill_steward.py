@@ -100,6 +100,11 @@ NEGATIVE_TERMS = (
 TEXT_SUFFIXES = {".jsonl", ".json", ".log", ".txt", ".md", ".yaml", ".yml"}
 MAX_LOG_BYTES = 100 * 1024 * 1024
 READ_TAIL_BYTES = 256 * 1024
+USAGE_WINDOWS = (("last_24h", "24h", 1), ("last_7d", "7d", 7), ("last_30d", "30d", 30))
+TIMESTAMP_KEYS = ("timestamp", "time", "created_at", "createdAt", "date", "ts")
+ISO_TIMESTAMP_PATTERN = re.compile(
+    r"\d{4}-\d{2}-\d{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:?[0-9]{2})?"
+)
 SKIP_LOG_DIRS = {
     ".git",
     ".venv",
@@ -724,10 +729,101 @@ def walk_log_paths(root: Path) -> Iterable[Path]:
             yield base / filename
 
 
-def iter_log_files(roots: Iterable[Path], days: int) -> Iterable[Path]:
+def infer_agent_from_path(path: Path) -> str:
+    parts = {part.lower() for part in path.parts}
+    for agent in ("codex", "claude", "gemini", "cursor"):
+        if f".{agent}" in parts or agent in parts:
+            return agent
+    return "unknown"
+
+
+def line_has_term(line: str, terms: tuple[str, ...]) -> bool:
+    lower = line.lower()
+    return any(term in lower for term in terms)
+
+
+def normalize_now(now: datetime | None = None) -> datetime:
+    value = now or datetime.now(timezone.utc)
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def parse_timestamp_value(value: object) -> float | None:
+    if isinstance(value, (int, float)):
+        timestamp = float(value)
+        if timestamp > 10_000_000_000:
+            timestamp = timestamp / 1000
+        return timestamp
+    if not isinstance(value, str):
+        return None
+
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        return parse_timestamp_value(float(text))
+    except ValueError:
+        pass
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    if re.search(r"[+-][0-9]{4}$", text):
+        text = f"{text[:-5]}{text[-5:-2]}:{text[-2:]}"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).timestamp()
+
+
+def line_timestamp(line: str, fallback_timestamp: float) -> float:
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, dict):
+        for key in TIMESTAMP_KEYS:
+            parsed = parse_timestamp_value(payload.get(key))
+            if parsed is not None:
+                return parsed
+
+    match = ISO_TIMESTAMP_PATTERN.search(line)
+    if match:
+        parsed = parse_timestamp_value(match.group(0))
+        if parsed is not None:
+            return parsed
+    return fallback_timestamp
+
+
+def read_recent_log_text(path: Path) -> str:
+    size = path.stat().st_size
+    with path.open("rb") as handle:
+        if size > READ_TAIL_BYTES:
+            handle.seek(-READ_TAIL_BYTES, os.SEEK_END)
+        return handle.read().decode("utf-8", errors="ignore")
+
+
+def skill_name_pattern(names: list[str]) -> tuple[dict[str, str], re.Pattern | None]:
+    name_lookup = {name.lower(): name for name in names}
+    if not names:
+        return name_lookup, None
+    alternates = "|".join(re.escape(name.lower()) for name in sorted(names, key=len, reverse=True))
+    return name_lookup, re.compile(r"(?<![A-Za-z0-9_-])(" + alternates + r")(?![A-Za-z0-9_-])")
+
+
+def matched_skill_names(line: str, name_lookup: dict[str, str], name_pattern: re.Pattern | None) -> set[str]:
+    if name_pattern is None:
+        return set()
+    return {name_lookup[match.group(1)] for match in name_pattern.finditer(line.lower())}
+
+
+def iter_log_files(roots: Iterable[Path], days: int, now: datetime | None = None) -> Iterable[Path]:
     cutoff = None
+    current = normalize_now(now)
     if days > 0:
-        cutoff = datetime.now(timezone.utc).timestamp() - days * 86400
+        cutoff = current.timestamp() - days * 86400
 
     for root in roots:
         if not root.exists():
@@ -748,28 +844,7 @@ def iter_log_files(roots: Iterable[Path], days: int) -> Iterable[Path]:
             yield path
 
 
-def infer_agent_from_path(path: Path) -> str:
-    parts = {part.lower() for part in path.parts}
-    for agent in ("codex", "claude", "gemini", "cursor"):
-        if f".{agent}" in parts or agent in parts:
-            return agent
-    return "unknown"
-
-
-def line_has_term(line: str, terms: tuple[str, ...]) -> bool:
-    lower = line.lower()
-    return any(term in lower for term in terms)
-
-
-def read_recent_log_text(path: Path) -> str:
-    size = path.stat().st_size
-    with path.open("rb") as handle:
-        if size > READ_TAIL_BYTES:
-            handle.seek(-READ_TAIL_BYTES, os.SEEK_END)
-        return handle.read().decode("utf-8", errors="ignore")
-
-
-def usage_report(skills: list[dict], log_roots: list[Path], days: int) -> list[dict]:
+def usage_report(skills: list[dict], log_roots: list[Path], days: int, now: datetime | None = None) -> list[dict]:
     names = sorted({skill["name"] for skill in skills})
     counters = {
         name: {
@@ -783,14 +858,9 @@ def usage_report(skills: list[dict], log_roots: list[Path], days: int) -> list[d
         }
         for name in names
     }
-    name_lookup = {name.lower(): name for name in names}
-    if names:
-        alternates = "|".join(re.escape(name.lower()) for name in sorted(names, key=len, reverse=True))
-        name_pattern = re.compile(r"(?<![A-Za-z0-9_-])(" + alternates + r")(?![A-Za-z0-9_-])")
-    else:
-        name_pattern = None
+    name_lookup, name_pattern = skill_name_pattern(names)
 
-    for log_file in iter_log_files(log_roots, days):
+    for log_file in iter_log_files(log_roots, days, now):
         agent = infer_agent_from_path(log_file)
         try:
             mtime = datetime.fromtimestamp(log_file.stat().st_mtime, timezone.utc).isoformat()
@@ -800,9 +870,7 @@ def usage_report(skills: list[dict], log_roots: list[Path], days: int) -> list[d
 
         for line in lines:
             lower = line.lower()
-            if name_pattern is None:
-                continue
-            matched_names = {name_lookup[match.group(1)] for match in name_pattern.finditer(lower)}
+            matched_names = matched_skill_names(line, name_lookup, name_pattern)
             if not matched_names:
                 continue
             positive = line_has_term(lower, POSITIVE_TERMS)
@@ -827,6 +895,60 @@ def usage_report(skills: list[dict], log_roots: list[Path], days: int) -> list[d
         counters.values(),
         key=lambda item: (item["total_mentions"], item["last_seen"] or ""),
         reverse=True,
+    )
+
+
+def usage_window_report(
+    skills: list[dict],
+    log_roots: list[Path],
+    now: datetime | None = None,
+    windows: tuple[tuple[str, str, int], ...] = USAGE_WINDOWS,
+) -> list[dict]:
+    current = normalize_now(now)
+    current_timestamp = current.timestamp()
+    max_days = max(days for _, _, days in windows)
+    names = sorted({skill["name"] for skill in skills})
+    counters = {
+        name: {
+            "name": name,
+            **{key: 0 for key, _, _ in windows},
+            "by_agent": {},
+            "last_seen": None,
+        }
+        for name in names
+    }
+    name_lookup, name_pattern = skill_name_pattern(names)
+
+    for log_file in iter_log_files(log_roots, max_days, current):
+        agent = infer_agent_from_path(log_file)
+        try:
+            fallback_timestamp = log_file.stat().st_mtime
+            lines = read_recent_log_text(log_file).splitlines()
+        except OSError:
+            continue
+
+        for line in lines:
+            matched_names = matched_skill_names(line, name_lookup, name_pattern)
+            if not matched_names:
+                continue
+            event_timestamp = line_timestamp(line, fallback_timestamp)
+            age_seconds = current_timestamp - event_timestamp
+            if age_seconds > max_days * 86400:
+                continue
+            event_iso = datetime.fromtimestamp(event_timestamp, timezone.utc).isoformat()
+            for name in matched_names:
+                row = counters[name]
+                by_agent = row["by_agent"].setdefault(agent, {key: 0 for key, _, _ in windows})
+                for key, _, days in windows:
+                    if age_seconds <= days * 86400:
+                        row[key] += 1
+                        by_agent[key] += 1
+                if row["last_seen"] is None or event_iso > row["last_seen"]:
+                    row["last_seen"] = event_iso
+
+    return sorted(
+        counters.values(),
+        key=lambda item: tuple([-item[key] for key, _, _ in reversed(windows)]) + (item["name"],),
     )
 
 
@@ -915,16 +1037,19 @@ def build_report(
     project: Path | None = None,
     days: int = 90,
     log_roots: list[Path] | None = None,
+    now: datetime | None = None,
 ) -> dict:
+    current = normalize_now(now)
     home = (home or Path.home()).expanduser().resolve()
     project = project.expanduser().resolve() if project is not None else None
     skills, roots = discover_skills(home, project)
     duplicates = duplicate_report(skills)
     logs = default_log_roots(home, project) if log_roots is None else [path.expanduser().resolve() for path in log_roots]
-    usage = usage_report(skills, logs, days)
+    usage = usage_report(skills, logs, days, current)
+    usage_windows = usage_window_report(skills, logs, current)
     recommendations = build_recommendations(skills, duplicates, usage, days)
     return {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": current.isoformat(),
         "home": str(home),
         "project": str(project) if project else None,
         "days": days,
@@ -933,6 +1058,7 @@ def build_report(
         "skills": skills,
         "duplicates": duplicates,
         "usage": usage,
+        "usage_windows": usage_windows,
         "recommendations": recommendations,
     }
 
@@ -972,6 +1098,18 @@ def print_text(report: dict) -> None:
                 f"- {item['name']}: mentions={item['total_mentions']} "
                 f"score={score_text} last_seen={item['last_seen'] or 'never'}"
             )
+        print()
+
+    if report.get("usage_windows"):
+        print("Usage by Window")
+        rows = report["usage_windows"]
+        name_width = max([len("Skill"), *[len(item["name"]) for item in rows]])
+        headers = " ".join(label.rjust(5) for _, label, _ in USAGE_WINDOWS)
+        print(f"{'Skill':<{name_width}} {headers} Last Seen")
+        print(f"{'-' * name_width} {'-' * len(headers)} ---------")
+        for item in rows:
+            counts = " ".join(str(item[key]).rjust(5) for key, _, _ in USAGE_WINDOWS)
+            print(f"{item['name']:<{name_width}} {counts} {item['last_seen'] or 'never'}")
         print()
 
     if report["recommendations"]:

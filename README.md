@@ -11,6 +11,7 @@ It helps agents:
 - create native symlink bridges so agents that only scan their own skills directory can see shared skills without copied duplicates
 - configure managed agents from a numbered selection menu with `install`, `add`, `delete`, `set`, and `list`
 - scan local session logs for approximate usage and effectiveness signals
+- summarize each skill's approximate usage over the last 24 hours, 7 days, and 30 days
 - suggest stale, duplicate, or misplaced skills for review
 
 The report mode is non-destructive by default. `--apply-project-layout` intentionally changes project directories to match the canonical hidden layout.
@@ -86,6 +87,27 @@ You can also run the bundled script directly:
 python3 skill-steward/scripts/skill_steward.py --home "$HOME" --days 90
 python3 skill-steward/scripts/skill_steward.py --home "$HOME" --project "$PWD" --format json
 ```
+
+The text report includes a `Usage by Window` table with per-skill counts for the last 24 hours, 7 days, and 30 days. JSON output includes the same data in `usage_windows`:
+
+```json
+{
+  "name": "skill-steward",
+  "last_24h": 12,
+  "last_7d": 31,
+  "last_30d": 45,
+  "by_agent": {
+    "codex": {
+      "last_24h": 10,
+      "last_7d": 24,
+      "last_30d": 36
+    }
+  },
+  "last_seen": "2026-04-25T13:38:08.566000+00:00"
+}
+```
+
+These are approximate mention counts from local logs. When a log line has a timestamp, `skill-steward` uses it; otherwise it falls back to the log file modification time.
 
 ### Global Audit
 
