@@ -94,6 +94,12 @@ Use `--bridge-scope project`, `--bridge-scope global`, or `--bridge-scope both` 
 python3 scripts/skill_steward.py --home "$HOME" --project "$PWD" --format json > skill-report.json
 ```
 
+Use HTML for a local static report:
+
+```bash
+python3 scripts/skill_steward.py --home "$HOME" --format html > skill-report.html
+```
+
 5. Review recommendations in this order:
 - `deduplicate`: same skill name exists in multiple roots. Keep one canonical copy.
 - `move-to-shared`: an agent-specific skill looks agent-neutral.

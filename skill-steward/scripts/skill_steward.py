@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import os
 import re
@@ -1653,6 +1654,113 @@ def print_text(report: dict) -> None:
                 print(f"  path: {item['path']}")
 
 
+def html_cell(value: object) -> str:
+    if value is None:
+        return ""
+    return html.escape(str(value))
+
+
+def html_table(headers: list[str], rows: list[list[object]]) -> str:
+    head = "".join(f"<th>{html_cell(header)}</th>" for header in headers)
+    body_rows = []
+    for row in rows:
+        cells = "".join(f"<td>{html_cell(cell)}</td>" for cell in row)
+        body_rows.append(f"<tr>{cells}</tr>")
+    body = "\n".join(body_rows)
+    return f"<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
+
+
+def render_html_report(report: dict) -> str:
+    cleanup_rows = [
+        [
+            item["skill"],
+            item["recommendation"],
+            item["actual_or_likely_uses"],
+            item["mentions"],
+            f"{item['confidence']:.2f}",
+            item["last_seen"] or "never",
+            item["reason"],
+        ]
+        for item in report.get("cleanup_recommendations", [])
+    ]
+    window_rows = [
+        [
+            item["name"],
+            item["last_24h"],
+            item["last_7d"],
+            item["last_30d"],
+            item["last_seen"] or "never",
+        ]
+        for item in report.get("usage_windows", [])
+    ]
+    confidence_rows = [
+        [
+            item["name"],
+            item["actual_or_likely_uses"],
+            item["mentions"],
+            f"{item['confidence']:.2f}",
+            item["event_type"],
+            item["success_signals"],
+            item["failure_signals"],
+            item["last_seen"] or "never",
+        ]
+        for item in report.get("usage_confidence", [])
+    ]
+    duplicate_rows = [
+        [
+            item["name"],
+            len(item["locations"]),
+            item["same_content"],
+            "; ".join(loc["path"] for loc in item["locations"]),
+        ]
+        for item in report.get("duplicates", [])
+    ]
+
+    styles = """
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:32px;color:#1f2937;background:#f8fafc}
+h1{font-size:28px;margin:0 0 8px}
+h2{font-size:18px;margin:28px 0 10px}
+.meta,.summary{color:#4b5563}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:18px 0}
+.card{background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:12px}
+.value{font-size:24px;font-weight:700;color:#111827}
+table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden}
+th,td{padding:8px 10px;border-bottom:1px solid #e5e7eb;text-align:left;font-size:13px;vertical-align:top}
+th{background:#f3f4f6;font-weight:600}
+tr:last-child td{border-bottom:0}
+code{background:#eef2ff;padding:2px 4px;border-radius:4px}
+"""
+    sections = [
+        "<!doctype html>",
+        "<html><head><meta charset=\"utf-8\"><title>Skill Steward Report</title>",
+        f"<style>{styles}</style></head><body>",
+        "<h1>Skill Steward Report</h1>",
+        f"<div class=\"meta\">Generated at {html_cell(report.get('generated_at'))}</div>",
+        f"<div class=\"meta\">Home: <code>{html_cell(report.get('home'))}</code></div>",
+    ]
+    if report.get("project"):
+        sections.append(f"<div class=\"meta\">Project: <code>{html_cell(report.get('project'))}</code></div>")
+    sections.extend(
+        [
+            "<div class=\"cards\">",
+            f"<div class=\"card\"><div>Skills</div><div class=\"value\">{len(report.get('skills', []))}</div></div>",
+            f"<div class=\"card\"><div>Duplicates</div><div class=\"value\">{len(report.get('duplicates', []))}</div></div>",
+            f"<div class=\"card\"><div>Cleanup Items</div><div class=\"value\">{len(report.get('cleanup_recommendations', []))}</div></div>",
+            "</div>",
+            "<h2>Cleanup Recommendations</h2>",
+            html_table(["Skill", "Recommendation", "Likely Uses", "Mentions", "Confidence", "Last Seen", "Reason"], cleanup_rows),
+            "<h2>Usage by Window</h2>",
+            html_table(["Skill", "24h", "7d", "30d", "Last Seen"], window_rows),
+            "<h2>Usage Confidence</h2>",
+            html_table(["Skill", "Likely Uses", "Mentions", "Confidence", "Type", "+", "-", "Last Seen"], confidence_rows),
+            "<h2>Duplicates</h2>",
+            html_table(["Skill", "Locations", "Same Content", "Paths"], duplicate_rows),
+            "</body></html>",
+        ]
+    )
+    return "\n".join(sections)
+
+
 def print_actions(actions: list[dict]) -> None:
     for action in actions:
         details = " ".join(f"{key}={value}" for key, value in action.items() if key != "action")
@@ -1907,7 +2015,7 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         help="Agent-specific project skill directory to ensure when using --apply-project-layout. Repeatable; overrides configured managed agents.",
     )
-    parser.add_argument("--format", choices=("text", "json"), default="text", help="Output format.")
+    parser.add_argument("--format", choices=("text", "json", "html"), default="text", help="Output format.")
     args = parser.parse_args(argv)
 
     layout_actions: list[dict] = []
@@ -1947,6 +2055,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.format == "json":
         json.dump(report, sys.stdout, indent=2, sort_keys=True)
         print()
+    elif args.format == "html":
+        print(render_html_report(report))
     else:
         print_text(report)
     return 0

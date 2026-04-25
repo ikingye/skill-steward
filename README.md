@@ -89,6 +89,12 @@ python3 skill-steward/scripts/skill_steward.py --home "$HOME" --days 90
 python3 skill-steward/scripts/skill_steward.py --home "$HOME" --project "$PWD" --format json
 ```
 
+Generate a static HTML report that can be opened locally:
+
+```bash
+python3 skill-steward/scripts/skill_steward.py --home "$HOME" --format html > skill-report.html
+```
+
 The text report includes a `Usage by Window` table with per-skill counts for the last 24 hours, 7 days, and 30 days. JSON output includes the same data in `usage_windows`:
 
 ```json

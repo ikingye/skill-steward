@@ -373,6 +373,25 @@ class ManageAgentSkillsTest(unittest.TestCase):
             self.assertEqual(payload["cleanup_recommendations"][0]["skill"], "never-seen")
             self.assertEqual(payload["cleanup_recommendations"][0]["recommendation"], "review-manually")
 
+    def test_cli_can_render_static_html_report(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            write_skill(home / ".agents" / "skills", "alpha-skill", "alpha-skill", "Use when testing alpha")
+
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(module.main(["--home", str(home), "--format", "html"]), 0)
+
+            html = output.getvalue()
+            self.assertIn("<!doctype html>", html)
+            self.assertIn("Skill Steward Report", html)
+            self.assertIn("Usage by Window", html)
+            self.assertIn("Usage Confidence", html)
+            self.assertIn("Cleanup Recommendations", html)
+            self.assertIn("alpha-skill", html)
+
     def test_symlinked_agent_root_does_not_create_false_duplicate(self):
         module = load_module()
 
