@@ -124,6 +124,15 @@ The report also includes `Usage Confidence`, exposed as `usage_confidence` in JS
 
 Use `actual_or_likely_uses`, `mentions`, `event_type`, `confidence`, `success_signals`, and `failure_signals` together. `confidence` weights strong signals as `1.0`, likely signals as `0.7`, and mention-only signals as `0.2`.
 
+Record explicit usage events when a wrapper, agent instruction, or user workflow knows a skill was used:
+
+```bash
+python3 scripts/skill_steward.py event used <skill-name> --agent codex --outcome success
+python3 scripts/skill_steward.py event likely <skill-name> --agent claude
+```
+
+Events are appended to `~/.agents/skill-steward/events.jsonl` and included in future audits automatically.
+
 Treat these as triage signals, not truth. A high count may include discussions about a skill rather than real activation. A low count may mean an agent does not log skill use explicitly. Use the ranking to choose what to inspect manually.
 
 ## Safe Cleanup Rules

@@ -63,6 +63,7 @@ LEGACY_LOADER_PATTERN = re.compile(
 CONFIG_ENV = "SKILL_STEWARD_CONFIG"
 DEFAULT_CONFIG_PATH = Path("~/.config/skill-steward/config.json")
 TRASH_ROOT_REL = Path(".agents/.trash/skills")
+EVENT_LOG_REL = Path(".agents/skill-steward/events.jsonl")
 
 PROTECTED_PARTS = {".system", "codex-primary-runtime", ".builtin", ".curated"}
 
@@ -107,7 +108,7 @@ TIMESTAMP_KEYS = ("timestamp", "time", "created_at", "createdAt", "date", "ts")
 STRUCTURED_SKILL_KEYS = ("skill", "skill_name", "skillName")
 STRUCTURED_EVENT_KEYS = ("event", "action", "type")
 USED_EVENTS = {"use", "used", "using", "load", "loaded", "invoke", "invoked", "activate", "activated", "trigger", "triggered"}
-LIKELY_EVENTS = {"request", "requested", "recommend", "recommended", "suggest", "suggested", "select", "selected"}
+LIKELY_EVENTS = {"likely", "request", "requested", "recommend", "recommended", "suggest", "suggested", "select", "selected"}
 SIGNAL_WEIGHTS = {"used": 1.0, "likely": 0.7, "mention": 0.2}
 ISO_TIMESTAMP_PATTERN = re.compile(
     r"\d{4}-\d{2}-\d{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:?[0-9]{2})?"
@@ -926,6 +927,7 @@ def default_log_roots(home: Path, project: Path | None = None) -> list[Path]:
     candidates = [
         home / ".codex" / "sessions",
         home / ".codex" / "history.jsonl",
+        home / EVENT_LOG_REL,
         home / ".claude" / "projects",
         home / ".claude" / "sessions",
         home / ".gemini" / "history",
@@ -1068,6 +1070,13 @@ def payload_skill_names(payload: dict) -> set[str]:
     return names
 
 
+def line_agent(line: str, fallback_agent: str) -> str:
+    payload = parse_json_line(line)
+    if isinstance(payload, dict) and isinstance(payload.get("agent"), str) and payload["agent"].strip():
+        return payload["agent"].strip().lower()
+    return fallback_agent
+
+
 def structured_signal(line: str, skill_name: str) -> str | None:
     payload = parse_json_line(line)
     if payload is None or skill_name.lower() not in payload_skill_names(payload):
@@ -1180,12 +1189,13 @@ def usage_report(skills: list[dict], log_roots: list[Path], days: int, now: date
             matched_names = matched_skill_names(line, name_lookup, name_pattern)
             if not matched_names:
                 continue
+            event_agent = line_agent(line, agent)
             positive = line_has_term(lower, POSITIVE_TERMS)
             negative = line_has_term(lower, NEGATIVE_TERMS)
             for name in matched_names:
                 row = counters[name]
                 row["total_mentions"] += 1
-                row["by_agent"][agent] = row["by_agent"].get(agent, 0) + 1
+                row["by_agent"][event_agent] = row["by_agent"].get(event_agent, 0) + 1
                 if positive:
                     row["positive_signals"] += 1
                 if negative:
@@ -1238,6 +1248,7 @@ def usage_window_report(
             matched_names = matched_skill_names(line, name_lookup, name_pattern)
             if not matched_names:
                 continue
+            event_agent = line_agent(line, agent)
             event_timestamp = line_timestamp(line, fallback_timestamp)
             age_seconds = current_timestamp - event_timestamp
             if age_seconds > max_days * 86400:
@@ -1245,7 +1256,7 @@ def usage_window_report(
             event_iso = datetime.fromtimestamp(event_timestamp, timezone.utc).isoformat()
             for name in matched_names:
                 row = counters[name]
-                by_agent = row["by_agent"].setdefault(agent, {key: 0 for key, _, _ in windows})
+                by_agent = row["by_agent"].setdefault(event_agent, {key: 0 for key, _, _ in windows})
                 for key, _, days in windows:
                     if age_seconds <= days * 86400:
                         row[key] += 1
@@ -1298,6 +1309,7 @@ def usage_confidence_report(
             matched_names = matched_skill_names(line, name_lookup, name_pattern)
             if not matched_names:
                 continue
+            event_agent = line_agent(line, agent)
             lower = line.lower()
             positive = line_has_term(lower, POSITIVE_TERMS)
             negative = line_has_term(lower, NEGATIVE_TERMS)
@@ -1324,7 +1336,7 @@ def usage_confidence_report(
                     row["last_seen"] = event_iso
 
                 agent_row = row["by_agent"].setdefault(
-                    agent,
+                    event_agent,
                     {
                         "mentions": 0,
                         "actual_or_likely_uses": 0,
@@ -1855,6 +1867,64 @@ def handle_skills_command(argv: list[str]) -> int:
     return 0
 
 
+def event_log_path(home: Path | None = None) -> Path:
+    home = (home or Path.home()).expanduser().resolve()
+    return home / EVENT_LOG_REL
+
+
+def record_usage_event(
+    event: str,
+    skill: str,
+    agent: str = "unknown",
+    outcome: str = "unknown",
+    home: Path | None = None,
+    project: Path | None = None,
+    now: datetime | None = None,
+) -> dict:
+    path = event_log_path(home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "timestamp": normalize_now(now).isoformat(),
+        "event": event,
+        "skill": skill,
+        "agent": agent,
+        "outcome": outcome,
+        "text": f"skill-steward event {event} {skill} {outcome}",
+    }
+    if project is not None:
+        payload["project"] = str(project.expanduser().resolve())
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True) + "\n")
+    return {"action": "record-event", "path": str(path), "event": payload}
+
+
+def handle_event_command(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="Record an explicit skill usage event.")
+    parser.add_argument("event", choices=("used", "likely", "mention"), help="Event strength to record.")
+    parser.add_argument("skill", help="Skill name.")
+    parser.add_argument("--agent", default="unknown", help="Agent name, for example codex or claude.")
+    parser.add_argument("--outcome", choices=("success", "failure", "unknown"), default="unknown", help="Outcome signal.")
+    parser.add_argument("--home", type=Path, default=Path.home(), help="Home directory.")
+    parser.add_argument("--project", type=Path, help="Optional project directory.")
+    parser.add_argument("--format", choices=("text", "json"), default="text", help="Output format.")
+    args = parser.parse_args(argv)
+
+    record = record_usage_event(
+        event=args.event,
+        skill=args.skill,
+        agent=args.agent,
+        outcome=args.outcome,
+        home=args.home,
+        project=args.project,
+    )
+    if args.format == "json":
+        json.dump(record, sys.stdout, indent=2, sort_keys=True)
+        print()
+    else:
+        print(f"Recorded {record['event']['event']} for {record['event']['skill']} at {record['path']}")
+    return 0
+
+
 def handle_agents_command(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Manage skill-steward agent configuration.")
     parser.add_argument("--config", type=Path, help="Config file path. Defaults to ~/.config/skill-steward/config.json.")
@@ -1971,6 +2041,8 @@ def handle_install_command(argv: list[str]) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == "event":
+        return handle_event_command(argv[1:])
     if argv and argv[0] == "skills":
         return handle_skills_command(argv[1:])
     if argv and argv[0] == "agents":

@@ -392,6 +392,47 @@ class ManageAgentSkillsTest(unittest.TestCase):
             self.assertIn("Cleanup Recommendations", html)
             self.assertIn("alpha-skill", html)
 
+    def test_event_command_writes_structured_event_and_report_reads_it(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            write_skill(home / ".agents" / "skills", "alpha-skill", "alpha-skill", "Use when testing alpha")
+
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(
+                    module.main(
+                        [
+                            "event",
+                            "used",
+                            "alpha-skill",
+                            "--agent",
+                            "codex",
+                            "--outcome",
+                            "success",
+                            "--home",
+                            str(home),
+                            "--format",
+                            "json",
+                        ]
+                    ),
+                    0,
+                )
+
+            payload = json.loads(output.getvalue())
+            event_file = Path(payload["path"])
+            self.assertTrue(event_file.is_file())
+
+            report = module.build_report(home=home, project=None, days=90, log_roots=None)
+            confidence = {item["name"]: item for item in report["usage_confidence"]}
+
+            self.assertEqual(confidence["alpha-skill"]["event_type"], "used")
+            self.assertEqual(confidence["alpha-skill"]["strong_signals"], 1)
+            self.assertEqual(confidence["alpha-skill"]["actual_or_likely_uses"], 1)
+            self.assertEqual(confidence["alpha-skill"]["success_signals"], 1)
+            self.assertEqual(confidence["alpha-skill"]["by_agent"]["codex"]["strong_signals"], 1)
+
     def test_symlinked_agent_root_does_not_create_false_duplicate(self):
         module = load_module()
 

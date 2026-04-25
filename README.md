@@ -150,6 +150,15 @@ Signal strength is intentionally conservative:
 
 `confidence` is a weighted score over mentions: strong signals count as `1.0`, likely signals as `0.7`, and mention-only signals as `0.2`.
 
+Record explicit usage events when an agent or wrapper knows a skill was used:
+
+```bash
+python3 skill-steward/scripts/skill_steward.py event used skill-steward --agent codex --outcome success
+python3 skill-steward/scripts/skill_steward.py event likely skill-steward --agent claude
+```
+
+Events are appended to `~/.agents/skill-steward/events.jsonl` and included in later audits automatically.
+
 ### Global Audit
 
 Audit global shared and agent-specific skills:
