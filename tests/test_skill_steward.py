@@ -584,6 +584,20 @@ class ManageAgentSkillsTest(unittest.TestCase):
             issue_codes = {issue["code"] for issue in quality["script-skill"]["issues"]}
             self.assertNotIn("non-executable-script", issue_codes)
 
+    def test_skills_cli_quality_fail_on_issues_returns_nonzero(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            write_skill(home / ".agents" / "skills", "bad-skill", "bad-skill", "Use when doing anything")
+
+            output = StringIO()
+            with redirect_stdout(output):
+                result = module.main(["skills", "quality", "--home", str(home), "--fail-on-issues"])
+
+            self.assertEqual(result, 1)
+            self.assertIn("bad-skill", output.getvalue())
+
     def test_symlinked_agent_root_does_not_create_false_duplicate(self):
         module = load_module()
 

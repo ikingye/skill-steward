@@ -200,6 +200,14 @@ python3 skill-steward/scripts/skill_steward.py skills quality --fix
 
 `--fix` currently only adds executable bits to non-protected shebang scripts under `scripts/`. It does not rewrite hardcoded paths, change descriptions, move skills between directories, or modify protected runtime skills.
 
+Use quality checks as a CI gate:
+
+```bash
+python3 skill-steward/scripts/skill_steward.py skills quality --project "$PWD" --fail-on-issues
+```
+
+`--fail-on-issues` returns exit code 1 when active quality issues remain. Findings ignored by policy do not fail the command.
+
 ### Global Audit
 
 Audit global shared and agent-specific skills:

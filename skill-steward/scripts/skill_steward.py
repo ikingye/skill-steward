@@ -2140,6 +2140,11 @@ def handle_skills_command(argv: list[str]) -> int:
         action="store_true",
         help="Apply safe automatic fixes, currently chmod +x for non-protected shebang scripts.",
     )
+    quality_parser.add_argument(
+        "--fail-on-issues",
+        action="store_true",
+        help="Return exit code 1 when active quality issues remain.",
+    )
     add_common_options(quality_parser)
 
     args = parser.parse_args(argv)
@@ -2234,6 +2239,8 @@ def handle_skills_command(argv: list[str]) -> int:
                 f"- {item.get('skill')} status={item.get('status')} "
                 f"trash={Path(item.get('trash_dir', '')).name} original={item.get('original_path')}"
             )
+    if "quality" in payload and getattr(args, "fail_on_issues", False):
+        return 1 if any(item["issues"] for item in payload["quality"]) else 0
     return 0
 
 
