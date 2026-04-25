@@ -130,6 +130,26 @@ Treat these as triage signals, not truth. A high count may include discussions a
 - When two copies differ, compare `SKILL.md`, scripts, and references before choosing the canonical copy.
 - For project-only conventions, prefer project shared or project agent-specific directories over global directories.
 
+## Cleanup Commands
+
+Prefer reversible quarantine before deletion:
+
+```bash
+python3 scripts/skill_steward.py skills quarantine <skill-name>
+python3 scripts/skill_steward.py skills list-trash
+python3 scripts/skill_steward.py skills restore <skill-name>
+```
+
+Quarantine moves the skill into `~/.agents/.trash/skills/<timestamp>-<skill>/`, writes a manifest, and removes native bridge symlinks that point at the canonical skill. Restore moves the skill back and recreates those bridges.
+
+Permanent deletion requires explicit confirmation:
+
+```bash
+python3 scripts/skill_steward.py skills delete <skill-name> --yes
+```
+
+Protected runtime skills are skipped. Pass `--project <repo>` when cleaning project-level skills. Use `--format json` for automation.
+
 ## Script Notes
 
 `scripts/skill_steward.py` uses only Python's standard library. It defaults to the tail of recent log files for speed and skips heavy cache, plugin, extension, virtualenv, and repository directories.

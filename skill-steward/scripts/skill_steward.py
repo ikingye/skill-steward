@@ -61,6 +61,7 @@ LEGACY_LOADER_PATTERN = re.compile(
 )
 CONFIG_ENV = "SKILL_STEWARD_CONFIG"
 DEFAULT_CONFIG_PATH = Path("~/.config/skill-steward/config.json")
+TRASH_ROOT_REL = Path(".agents/.trash/skills")
 
 PROTECTED_PARTS = {".system", "codex-primary-runtime", ".builtin", ".curated"}
 
@@ -698,6 +699,225 @@ def apply_native_bridges(
             for source in shared_skills:
                 ensure_native_bridge(source, target_root, agent, scope, actions)
 
+    return actions
+
+
+def remove_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    else:
+        shutil.rmtree(path)
+
+
+def trash_root(home: Path) -> Path:
+    return home.expanduser().resolve() / TRASH_ROOT_REL
+
+
+def safe_trash_slug(name: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-")
+    return slug or "skill"
+
+
+def unique_trash_dir(home: Path, skill_name: str, now: datetime | None = None) -> Path:
+    current = normalize_now(now)
+    base = trash_root(home)
+    stem = f"{current.strftime('%Y%m%dT%H%M%SZ')}-{safe_trash_slug(skill_name)}"
+    candidate = base / stem
+    index = 2
+    while candidate.exists():
+        candidate = base / f"{stem}-{index}"
+        index += 1
+    return candidate
+
+
+def find_skill_matches(home: Path, project: Path | None, skill_name: str) -> list[dict]:
+    skills, _ = discover_skills(home, project)
+    return [skill for skill in skills if skill["name"] == skill_name or skill["folder"] == skill_name]
+
+
+def remove_native_bridges_for_skill(
+    home: Path,
+    project: Path | None,
+    skill_path: Path,
+    skill_name: str,
+    actions: list[dict],
+) -> list[dict]:
+    removed: list[dict] = []
+    canonical = skill_path.resolve()
+    bases = [("global", home)]
+    if project is not None:
+        bases.append(("project", project))
+
+    for scope, base in bases:
+        for agent, rel in AGENT_DIRS.items():
+            if agent == "shared":
+                continue
+            bridge = base / rel / skill_path.name
+            if not bridge.is_symlink() and skill_path.name != skill_name:
+                bridge = base / rel / skill_name
+            if not bridge.is_symlink():
+                continue
+            try:
+                current = bridge.resolve(strict=True)
+            except FileNotFoundError:
+                current = None
+            if current is not None and current != canonical:
+                continue
+            target = os.readlink(bridge)
+            bridge.unlink()
+            record = {
+                "action": "remove-native-bridge",
+                "agent": agent,
+                "scope": scope,
+                "path": str(bridge),
+                "target": target,
+            }
+            actions.append(record)
+            removed.append(record)
+    return removed
+
+
+def write_trash_manifest(trash_dir: Path, manifest: dict) -> None:
+    (trash_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def quarantine_skills(
+    home: Path | None = None,
+    project: Path | None = None,
+    skill_names: list[str] | None = None,
+    now: datetime | None = None,
+) -> list[dict]:
+    home = (home or Path.home()).expanduser().resolve()
+    project = project.expanduser().resolve() if project is not None else None
+    skill_names = skill_names or []
+    actions: list[dict] = []
+
+    for skill_name in skill_names:
+        matches = find_skill_matches(home, project, skill_name)
+        if not matches:
+            actions.append({"action": "not-found", "skill": skill_name})
+            continue
+
+        for skill in matches:
+            path = Path(skill["path"])
+            if skill["protected"]:
+                actions.append({"action": "skip-protected", "skill": skill["name"], "path": str(path)})
+                continue
+            if not path.exists() and not path.is_symlink():
+                actions.append({"action": "not-found", "skill": skill["name"], "path": str(path)})
+                continue
+
+            trash_dir = unique_trash_dir(home, skill["name"], now)
+            trash_dir.mkdir(parents=True)
+            removed_bridges = remove_native_bridges_for_skill(home, project, path, skill["name"], actions)
+            target = trash_dir / path.name
+            shutil.move(str(path), str(target))
+            manifest = {
+                "created_at": normalize_now(now).isoformat(),
+                "skill": skill["name"],
+                "folder": skill["folder"],
+                "scope": skill["scope"],
+                "agent": skill["agent"],
+                "original_path": str(path),
+                "quarantined_path": str(target),
+                "removed_bridges": removed_bridges,
+            }
+            write_trash_manifest(trash_dir, manifest)
+            actions.append(
+                {
+                    "action": "quarantine-skill",
+                    "skill": skill["name"],
+                    "path": str(path),
+                    "trash_dir": str(trash_dir),
+                }
+            )
+    return actions
+
+
+def delete_skills_permanently(
+    home: Path | None = None,
+    project: Path | None = None,
+    skill_names: list[str] | None = None,
+) -> list[dict]:
+    home = (home or Path.home()).expanduser().resolve()
+    project = project.expanduser().resolve() if project is not None else None
+    skill_names = skill_names or []
+    actions: list[dict] = []
+
+    for skill_name in skill_names:
+        matches = find_skill_matches(home, project, skill_name)
+        if not matches:
+            actions.append({"action": "not-found", "skill": skill_name})
+            continue
+        for skill in matches:
+            path = Path(skill["path"])
+            if skill["protected"]:
+                actions.append({"action": "skip-protected", "skill": skill["name"], "path": str(path)})
+                continue
+            if not path.exists() and not path.is_symlink():
+                actions.append({"action": "not-found", "skill": skill["name"], "path": str(path)})
+                continue
+            remove_native_bridges_for_skill(home, project, path, skill["name"], actions)
+            remove_path(path)
+            actions.append({"action": "delete-skill", "skill": skill["name"], "path": str(path)})
+    return actions
+
+
+def load_trash_manifests(home: Path | None = None) -> list[dict]:
+    home = (home or Path.home()).expanduser().resolve()
+    root = trash_root(home)
+    manifests: list[dict] = []
+    if not root.exists():
+        return manifests
+    for manifest_file in sorted(root.glob("*/manifest.json")):
+        try:
+            manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        manifest["trash_dir"] = str(manifest_file.parent)
+        manifest["status"] = "quarantined" if Path(manifest.get("quarantined_path", "")).exists() else "restored"
+        manifests.append(manifest)
+    return sorted(manifests, key=lambda item: (item.get("created_at", ""), item.get("skill", "")), reverse=True)
+
+
+def select_trash_manifest(home: Path, selector: str) -> dict | None:
+    manifests = load_trash_manifests(home)
+    matches = [
+        manifest
+        for manifest in manifests
+        if manifest.get("status") == "quarantined"
+        and (manifest.get("skill") == selector or Path(manifest.get("trash_dir", "")).name == selector)
+    ]
+    return matches[0] if matches else None
+
+
+def restore_skills(home: Path | None = None, selectors: list[str] | None = None) -> list[dict]:
+    home = (home or Path.home()).expanduser().resolve()
+    selectors = selectors or []
+    actions: list[dict] = []
+
+    for selector in selectors:
+        manifest = select_trash_manifest(home, selector)
+        if manifest is None:
+            actions.append({"action": "trash-not-found", "selector": selector})
+            continue
+        source = Path(manifest["quarantined_path"])
+        target = Path(manifest["original_path"])
+        if target.exists() or target.is_symlink():
+            actions.append({"action": "restore-conflict", "skill": manifest["skill"], "path": str(target)})
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(source), str(target))
+        actions.append({"action": "restore-skill", "skill": manifest["skill"], "path": str(target)})
+
+        for bridge in manifest.get("removed_bridges", []):
+            bridge_path = Path(bridge["path"])
+            if bridge_path.exists() or bridge_path.is_symlink():
+                actions.append({"action": "restore-bridge-conflict", "skill": manifest["skill"], "path": str(bridge_path)})
+                continue
+            bridge_path.parent.mkdir(parents=True, exist_ok=True)
+            bridge_path.symlink_to(target.resolve(), target_is_directory=True)
+            actions.append({"action": "restore-native-bridge", "skill": manifest["skill"], "path": str(bridge_path)})
     return actions
 
 
@@ -1344,6 +1564,75 @@ def print_text(report: dict) -> None:
                 print(f"  path: {item['path']}")
 
 
+def print_actions(actions: list[dict]) -> None:
+    for action in actions:
+        details = " ".join(f"{key}={value}" for key, value in action.items() if key != "action")
+        print(f"- {action['action']}{(' ' + details) if details else ''}")
+
+
+def handle_skills_command(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="Quarantine, restore, or delete skill directories safely.")
+    parser.add_argument("--home", type=Path, default=Path.home(), help="Home directory.")
+    parser.add_argument("--project", type=Path, help="Optional project directory.")
+    parser.add_argument("--format", choices=("text", "json"), default="text", help="Output format.")
+    subparsers = parser.add_subparsers(dest="skills_command", required=True)
+
+    def add_common_options(subparser: argparse.ArgumentParser) -> None:
+        subparser.add_argument("--home", type=Path, default=argparse.SUPPRESS, help="Home directory.")
+        subparser.add_argument("--project", type=Path, default=argparse.SUPPRESS, help="Optional project directory.")
+        subparser.add_argument("--format", choices=("text", "json"), default=argparse.SUPPRESS, help="Output format.")
+
+    quarantine_parser = subparsers.add_parser("quarantine", help="Move skills to the local skill-steward trash.")
+    quarantine_parser.add_argument("skills", nargs="+", help="Skill names or folder names to quarantine.")
+    add_common_options(quarantine_parser)
+
+    delete_parser = subparsers.add_parser("delete", help="Permanently delete skills. Requires --yes.")
+    delete_parser.add_argument("skills", nargs="+", help="Skill names or folder names to delete.")
+    delete_parser.add_argument("--yes", action="store_true", help="Confirm permanent deletion.")
+    add_common_options(delete_parser)
+
+    restore_parser = subparsers.add_parser("restore", help="Restore quarantined skills by skill name or trash id.")
+    restore_parser.add_argument("selectors", nargs="+", help="Skill names or trash directory ids to restore.")
+    add_common_options(restore_parser)
+
+    list_trash_parser = subparsers.add_parser("list-trash", help="List quarantined skills.")
+    add_common_options(list_trash_parser)
+
+    args = parser.parse_args(argv)
+    try:
+        if args.skills_command == "quarantine":
+            actions = quarantine_skills(home=args.home, project=args.project, skill_names=args.skills)
+            payload = {"actions": actions}
+        elif args.skills_command == "delete":
+            if not args.yes:
+                raise LayoutError("permanent delete requires --yes; use skills quarantine for reversible cleanup")
+            actions = delete_skills_permanently(home=args.home, project=args.project, skill_names=args.skills)
+            payload = {"actions": actions}
+        elif args.skills_command == "restore":
+            actions = restore_skills(home=args.home, selectors=args.selectors)
+            payload = {"actions": actions}
+        elif args.skills_command == "list-trash":
+            payload = {"trash": load_trash_manifests(args.home)}
+        else:
+            parser.error(f"unknown command: {args.skills_command}")
+    except LayoutError as exc:
+        print(f"Skill command failed: {exc}", file=sys.stderr)
+        return 1
+
+    if args.format == "json":
+        json.dump(payload, sys.stdout, indent=2, sort_keys=True)
+        print()
+    elif "actions" in payload:
+        print_actions(payload["actions"])
+    else:
+        for item in payload["trash"]:
+            print(
+                f"- {item.get('skill')} status={item.get('status')} "
+                f"trash={Path(item.get('trash_dir', '')).name} original={item.get('original_path')}"
+            )
+    return 0
+
+
 def handle_agents_command(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Manage skill-steward agent configuration.")
     parser.add_argument("--config", type=Path, help="Config file path. Defaults to ~/.config/skill-steward/config.json.")
@@ -1460,6 +1749,8 @@ def handle_install_command(argv: list[str]) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == "skills":
+        return handle_skills_command(argv[1:])
     if argv and argv[0] == "agents":
         return handle_agents_command(argv[1:])
     if argv and argv[0] in {"list", "add", "delete", "set"}:

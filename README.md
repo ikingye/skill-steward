@@ -201,6 +201,26 @@ With native bridges, a shared skill remains canonical in `.agents/skills`, while
 
 Use `--bridge-scope project`, `--bridge-scope global`, or `--bridge-scope both` to control where bridges are created. Be explicit in automation so a project-only operation does not also touch global directories.
 
+### Safe Cleanup
+
+Quarantine skills before deleting them permanently:
+
+```bash
+python3 skill-steward/scripts/skill_steward.py skills quarantine old-skill
+python3 skill-steward/scripts/skill_steward.py skills list-trash
+python3 skill-steward/scripts/skill_steward.py skills restore old-skill
+```
+
+Quarantine moves the canonical skill directory into `~/.agents/.trash/skills/<timestamp>-<skill>/`, writes a `manifest.json`, and removes native bridge symlinks that pointed at the skill. Restore moves the skill back and recreates those bridges.
+
+Protected runtime skills are skipped automatically. Permanent deletion is available, but requires explicit confirmation:
+
+```bash
+python3 skill-steward/scripts/skill_steward.py skills delete old-skill --yes
+```
+
+Each cleanup command supports `--home`, `--project`, and `--format json`.
+
 ### What Changes Files
 
 These modes mutate the filesystem:
@@ -208,6 +228,7 @@ These modes mutate the filesystem:
 - `install`, `add`, `delete`, and `set` update `~/.config/skill-steward/config.json` unless `--config` is supplied.
 - `--apply-project-layout` creates hidden project skill directories, writes managed instruction blocks, and removes identical duplicates.
 - `--apply-native-bridges` creates or refreshes symlink bridges from shared skills into managed native agent directories.
+- `skills quarantine`, `skills restore`, and `skills delete --yes` move, restore, or remove skill directories.
 
 Plain audit commands without `--apply-*` only report findings.
 

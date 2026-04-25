@@ -681,6 +681,72 @@ class ManageAgentSkillsTest(unittest.TestCase):
             self.assertTrue((project / ".claude" / "skills" / "project-shared").is_symlink())
             self.assertIn("Native bridge actions:", output.getvalue())
 
+    def test_quarantine_moves_skill_and_removes_native_bridge(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            home.mkdir()
+            shared = write_skill(home / ".agents" / "skills", "shared-only", "shared-only", "Use when managing notes")
+            bridge_root = home / ".codex" / "skills"
+            bridge_root.mkdir(parents=True)
+            (bridge_root / "shared-only").symlink_to(shared, target_is_directory=True)
+
+            actions = module.quarantine_skills(home=home, project=None, skill_names=["shared-only"])
+
+            self.assertFalse(shared.exists())
+            self.assertFalse((bridge_root / "shared-only").exists())
+            quarantined = [action for action in actions if action["action"] == "quarantine-skill"]
+            self.assertEqual(len(quarantined), 1)
+            trash_dir = Path(quarantined[0]["trash_dir"])
+            self.assertTrue((trash_dir / "shared-only" / "SKILL.md").is_file())
+            self.assertTrue((trash_dir / "manifest.json").is_file())
+
+            restore_actions = module.restore_skills(home=home, selectors=["shared-only"])
+
+            self.assertTrue((shared / "SKILL.md").is_file())
+            self.assertTrue((bridge_root / "shared-only").is_symlink())
+            self.assertEqual((bridge_root / "shared-only").resolve(), shared.resolve())
+            self.assertTrue(any(action["action"] == "restore-skill" for action in restore_actions))
+
+    def test_quarantine_skips_protected_skills(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            home.mkdir()
+            protected = write_skill(
+                home / ".codex" / "skills" / "codex-primary-runtime",
+                "spreadsheets",
+                "Excel",
+                "Use when editing spreadsheets",
+            )
+
+            actions = module.quarantine_skills(home=home, project=None, skill_names=["Excel"])
+
+            self.assertTrue((protected / "SKILL.md").is_file())
+            self.assertEqual(actions[0]["action"], "skip-protected")
+            self.assertEqual(actions[0]["skill"], "Excel")
+
+    def test_skills_cli_quarantine_outputs_json(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            home.mkdir()
+            write_skill(home / ".agents" / "skills", "shared-only", "shared-only", "Use when managing notes")
+
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(
+                    module.main(["skills", "quarantine", "shared-only", "--home", str(home), "--format", "json"]),
+                    0,
+                )
+
+            payload = json.loads(output.getvalue())
+            self.assertTrue(any(action["action"] == "quarantine-skill" for action in payload["actions"]))
+            self.assertFalse((home / ".agents" / "skills" / "shared-only").exists())
+
 
 if __name__ == "__main__":
     unittest.main()
