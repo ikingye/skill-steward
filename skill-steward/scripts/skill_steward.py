@@ -1574,6 +1574,33 @@ def non_executable_shebang_scripts(skill_dir: Path) -> list[str]:
     return scripts
 
 
+def skill_frontmatter_error(skill_file: Path) -> str | None:
+    try:
+        text = skill_file.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return f"cannot read SKILL.md: {exc}"
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return "missing YAML frontmatter delimited by ---"
+    if not any(line.strip() == "---" for line in lines[1:]):
+        return "missing closing YAML frontmatter delimiter ---"
+    metadata = parse_frontmatter(skill_file)
+    missing = [key for key in ("name", "description") if not metadata.get(key, "").strip()]
+    if missing:
+        return f"frontmatter missing required field(s): {', '.join(missing)}"
+    return None
+
+
+def invalid_skill_frontmatter_files(skill_dir: Path) -> list[dict]:
+    invalid: list[dict] = []
+    for skill_file in sorted(skill_dir.rglob("SKILL.md")):
+        error = skill_frontmatter_error(skill_file)
+        if error is None:
+            continue
+        invalid.append({"path": str(skill_file.relative_to(skill_dir)), "error": error})
+    return invalid
+
+
 def skill_quality_report(skills: list[dict], policy: dict | None = None) -> list[dict]:
     policy = policy or {}
     rows: list[dict] = []
@@ -1586,6 +1613,19 @@ def skill_quality_report(skills: list[dict], policy: dict | None = None) -> list
             skill_text = skill_file.read_text(encoding="utf-8", errors="replace")
         except OSError:
             skill_text = ""
+
+        invalid_frontmatter = invalid_skill_frontmatter_files(path)
+        if invalid_frontmatter:
+            paths = [item["path"] for item in invalid_frontmatter]
+            add_quality_issue(
+                issues,
+                "invalid-skill-frontmatter",
+                "high",
+                f"SKILL.md files have invalid YAML frontmatter: {', '.join(paths[:5])}.",
+                30,
+                paths=paths,
+                errors=invalid_frontmatter,
+            )
 
         if not description.strip():
             add_quality_issue(

@@ -467,6 +467,29 @@ class ManageAgentSkillsTest(unittest.TestCase):
             self.assertIn("non-executable-script", issue_codes)
             self.assertTrue((good / "SKILL.md").is_file())
 
+    def test_quality_report_flags_nested_invalid_skill_frontmatter(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            skill = write_skill(
+                home / ".agents" / "skills",
+                "plugin-skill",
+                "plugin-skill",
+                "Use when checking packaged skill plugin metadata",
+            )
+            nested_skill = skill / "plugins" / "plugin-skill" / "skills" / "plugin-skill"
+            nested_skill.mkdir(parents=True)
+            (nested_skill / "SKILL.md").write_text("../../../../SKILL.md", encoding="utf-8")
+
+            report = module.build_report(home=home, project=None, days=90, log_roots=[])
+            quality = {item["skill"]: item for item in report["quality"]}
+
+            issues = {issue["code"]: issue for issue in quality["plugin-skill"]["issues"]}
+            self.assertIn("invalid-skill-frontmatter", issues)
+            issue = issues["invalid-skill-frontmatter"]
+            self.assertEqual(issue["paths"], ["plugins/plugin-skill/skills/plugin-skill/SKILL.md"])
+
     def test_skills_cli_quality_outputs_json(self):
         module = load_module()
 

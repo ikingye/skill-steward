@@ -13,7 +13,7 @@ It helps agents:
 - scan local session logs for approximate usage and effectiveness signals
 - summarize each skill's approximate usage over the last 24 hours, 7 days, and 30 days
 - classify usage evidence as used, likely, or mention-only with a confidence score
-- check skill quality issues such as broad descriptions, hardcoded local paths, placement drift, and non-executable helper scripts
+- check skill quality issues such as invalid nested `SKILL.md` frontmatter, broad descriptions, hardcoded local paths, placement drift, and non-executable helper scripts
 - suggest stale, duplicate, or misplaced skills for review
 
 The report mode is non-destructive by default. `--apply-project-layout` intentionally changes project directories to match the canonical hidden layout.
@@ -173,6 +173,7 @@ Text output shows only skills with issues by default. Use `--all` to include cle
 
 The quality report assigns each skill a `quality_score` from 0 to 100 and lists issue codes such as:
 
+- `invalid-skill-frontmatter`: a `SKILL.md` file anywhere inside the skill package has missing or incomplete YAML frontmatter
 - `broad-description`: the description is too generic to help an agent decide when to load it
 - `hardcoded-absolute-path`: the skill contains a machine-specific path such as `/Users/...`
 - `non-executable-script`: a helper script has a shebang but is not executable
